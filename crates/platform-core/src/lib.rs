@@ -81,6 +81,8 @@ pub enum PlatformError {
     InvalidPackage(String),
     #[error("Mod `{mod_id}` requested permission `{permission}` which was not granted")]
     PermissionDenied { mod_id: String, permission: String },
+    #[error("Mod `{mod_id}` imports an API requiring unrequested permission `{permission}`")]
+    PermissionNotRequested { mod_id: String, permission: String },
     #[error("dependency resolution failed: {0}")]
     DependencyResolution(String),
     #[error("Wasm runtime setup failed: {0}")]
@@ -89,6 +91,51 @@ pub enum PlatformError {
     WasmModule { mod_id: String, message: String },
     #[error("failed to encode load plan: {0}")]
     Serialization(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformErrorCode {
+    Io,
+    InvalidManifest,
+    InvalidPackage,
+    PermissionDenied,
+    PermissionNotRequested,
+    DependencyResolution,
+    RuntimeSetup,
+    WasmModule,
+    Serialization,
+}
+
+impl PlatformErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Io => "platform.io",
+            Self::InvalidManifest => "platform.invalid_manifest",
+            Self::InvalidPackage => "platform.invalid_package",
+            Self::PermissionDenied => "platform.permission_denied",
+            Self::PermissionNotRequested => "platform.permission_not_requested",
+            Self::DependencyResolution => "platform.dependency_resolution",
+            Self::RuntimeSetup => "platform.runtime_setup",
+            Self::WasmModule => "platform.wasm_module",
+            Self::Serialization => "platform.serialization",
+        }
+    }
+}
+
+impl PlatformError {
+    pub const fn code(&self) -> PlatformErrorCode {
+        match self {
+            Self::Io { .. } => PlatformErrorCode::Io,
+            Self::InvalidManifest(_) => PlatformErrorCode::InvalidManifest,
+            Self::InvalidPackage(_) => PlatformErrorCode::InvalidPackage,
+            Self::PermissionDenied { .. } => PlatformErrorCode::PermissionDenied,
+            Self::PermissionNotRequested { .. } => PlatformErrorCode::PermissionNotRequested,
+            Self::DependencyResolution(_) => PlatformErrorCode::DependencyResolution,
+            Self::RuntimeSetup(_) => PlatformErrorCode::RuntimeSetup,
+            Self::WasmModule { .. } => PlatformErrorCode::WasmModule,
+            Self::Serialization(_) => PlatformErrorCode::Serialization,
+        }
+    }
 }
 
 impl ModPackage {
@@ -359,14 +406,28 @@ impl LoadedWasmMod {
             }
         })?;
         for import in module.imports() {
-            if import.module() != "gk" || !matches!(import.name(), "counter_read" | "counter_set") {
-                return Err(PlatformError::WasmModule {
+            let required_permission = match (import.module(), import.name()) {
+                ("gk", "counter_read") => "world.read",
+                ("gk", "counter_set") => "world.command",
+                _ => {
+                    return Err(PlatformError::WasmModule {
+                        mod_id: package.manifest.id.clone(),
+                        message: format!(
+                            "unsupported import `{}::{}`; only the `gk` counter Host API is available",
+                            import.module(),
+                            import.name()
+                        ),
+                    });
+                }
+            };
+            if !package
+                .manifest
+                .requested_permissions
+                .contains(required_permission)
+            {
+                return Err(PlatformError::PermissionNotRequested {
                     mod_id: package.manifest.id.clone(),
-                    message: format!(
-                        "unsupported import `{}::{}`; only the `gk` counter Host API is available",
-                        import.module(),
-                        import.name()
-                    ),
+                    permission: required_permission.to_owned(),
                 });
             }
         }
@@ -683,6 +744,27 @@ mod tests {
             result,
             Err(PlatformError::PermissionDenied { .. })
         ));
+    }
+
+    #[test]
+    fn imported_host_api_requires_its_declared_permission() {
+        let mut package = ModPackage::load(sample_root()).unwrap();
+        package.manifest.requested_permissions = BTreeSet::from(["world.read".to_owned()]);
+        let grants = BTreeSet::from(["world.read".to_owned()]);
+        let engine = create_wasm_engine().unwrap();
+
+        let result = LoadedWasmMod::compile(&package, &grants, &engine);
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing requested permission was accepted"),
+        };
+        assert!(matches!(
+            &error,
+            PlatformError::PermissionNotRequested { permission, .. }
+                if permission == "world.command"
+        ));
+        assert_eq!(error.code().as_str(), "platform.permission_not_requested");
     }
 
     #[test]
