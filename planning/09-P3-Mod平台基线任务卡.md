@@ -1,7 +1,7 @@
 # P3 任务卡：Mod Platform 基线
 
 - 阶段：P3
-- 状态：P3 执行中；GK-P3-01 本地验收通过，Gitee Go 待本次提交确认
+- 状态：P3 执行中；GK-P3-01 已通过本地与 Gitee Go 验收，GK-P3-02 执行中
 - 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
 - 当前代码基线：`crates/platform-core` 包含严格 JSON Manifest 解析、本地目录发现、必需依赖 SemVer 校验、确定性拓扑解析、内存 LoadPlan、宿主权限授权和 Wasmtime 适配；目前仅有 `gk::counter_read` / `gk::counter_set` 两个 Host API。
 - 规范边界：仓库内独立的 `Mod Platform Specification v1.0.md` 是空文件；本卡以完整项目规范为依据。不得静默填充空文件或将未决字段假装成既有契约。
@@ -91,3 +91,14 @@
 ## 阶段完成定义
 
 P3 只有在 P3-01 至 P3-07 的契约和验收逐项通过后才完成。仅有 Manifest struct、内存 LoadPlan 或 Wasm 通过演示，不算正式 Schema、持久锁文件或生命周期系统。
+
+### GK-P3-01 — 远端验收
+
+- **状态：** 已通过 Gitee Go（用户确认 `b176d33` 构建成功）。
+- **结论：** `jsonschema` 锁定依赖在 Gitee Go 环境可用，GK-P3-01 远端门禁通过。
+
+### GK-P3-02 — Resolver 与依赖契约（进行中）
+
+- **已冻结的既有行为：** 每个 Mod ID 只接受一个候选包；重复 ID 拒绝，不进行版本挑选；必需直接依赖必须存在且满足 SemVer；依赖必须先于依赖者加载；同一拓扑层按 Mod ID 字典序稳定排序；循环（包含自依赖）拒绝整份计划。
+- **实现进展：** Resolver 校验 Manifest 依赖时按依赖 ID、版本范围排序，使多个错误同时存在时选出的诊断不依赖 JSON 数组顺序；LoadPlan 中依赖 ID 已排序。
+- **未决边界：** 多版本 side-by-side、可选依赖和 Mod 间公开 API 依赖仍不支持。

@@ -278,7 +278,16 @@ pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformEr
 
     for (id, package) in &by_id {
         let mut seen_dependencies = BTreeSet::new();
-        for dependency in &package.manifest.dependencies {
+        // Manifest array order is user-controlled. Resolve dependencies in a
+        // canonical order so that, when several entries are invalid, the
+        // selected diagnostic is stable as well as the resulting plan.
+        let mut dependencies = package.manifest.dependencies.iter().collect::<Vec<_>>();
+        dependencies.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.version.cmp(&right.version))
+        });
+        for dependency in dependencies {
             if !seen_dependencies.insert(dependency.id.clone()) {
                 return Err(PlatformError::DependencyResolution(format!(
                     "Mod `{id}` repeats dependency `{}`",
