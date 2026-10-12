@@ -77,12 +77,12 @@
 
 ### GK-P3-01 — Manifest v1 Schema 与诊断
 
-- **状态：** 本地验收通过，远端 CI 待确认。
+- **状态：** 本地与 Gitee Go 验收通过。
 - **实现：** 新增唯一规范 Schema `schemas/mod-manifest-v1.schema.json`，Platform 加载 Manifest 时先执行 Schema 校验，再执行 Rust 语义校验。错误使用稳定 `platform.invalid_manifest` 码，Schema 错误包含 JSON Pointer 字段路径；内置 Schema 加载失败使用 `platform.invalid_schema`。
 - **对齐：** 保持 P1 现有字段、默认空依赖、未知字段拒绝和两个既有权限；示例 Schema 与规范 Schema 通过测试保持逐字节一致。语义校验覆盖 SemVer、依赖范围和跨平台入口路径约束。
 - **测试：** Schema Draft 2020-12 元校验、示例包通过、未知字段和重复权限拒绝、ID/SemVer/权限/依赖范围非法拒绝、绝对路径/遍历/反斜线/无效扩展拒绝。
 - **本地门禁：** `cargo fmt --all -- --check`、`cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo test --locked --workspace`、`cargo run --locked -p game-platform -- demo` 均通过。Platform 12 项、Kernel 14 项、集成 3 项测试通过；demo 输出 `verified=true`。
-- **剩余：** Gitee Go 需验证全新 `jsonschema` 依赖在云端 Linux 可锁定构建；Manifest 其他字段保持未支持，不由此 Schema 推断。
+- **远端门禁：** 用户确认提交 `b176d33` 和后续提交 `a872a1c` 的 Gitee Go 构建均成功；新 `jsonschema` 锁定依赖在远端构建通过。Manifest 其他字段保持未支持，不由此 Schema 推断。
 
 ## 本阶段明确不做
 
@@ -94,11 +94,12 @@ P3 只有在 P3-01 至 P3-07 的契约和验收逐项通过后才完成。仅有
 
 ### GK-P3-01 — 远端验收
 
-- **状态：** 已通过 Gitee Go（用户确认 `b176d33` 构建成功）。
-- **结论：** `jsonschema` 锁定依赖在 Gitee Go 环境可用，GK-P3-01 远端门禁通过。
+- **状态：** 已通过 Gitee Go（用户确认 `b176d33` 与 `a872a1c` 均构建成功）。
+- **结论：** `jsonschema` 锁定依赖在 Gitee Go 环境可用；GK-P3-01 远端门禁通过。`a872a1c` 同时验证了 Resolver 诊断排序增量的云端编译。
 
 ### GK-P3-02 — Resolver 与依赖契约（进行中）
 
 - **已冻结的既有行为：** 每个 Mod ID 只接受一个候选包；重复 ID 拒绝，不进行版本挑选；必需直接依赖必须存在且满足 SemVer；依赖必须先于依赖者加载；同一拓扑层按 Mod ID 字典序稳定排序；循环（包含自依赖）拒绝整份计划。
-- **实现进展：** Resolver 校验 Manifest 依赖时按依赖 ID、版本范围排序，使多个错误同时存在时选出的诊断不依赖 JSON 数组顺序；LoadPlan 中依赖 ID 已排序。
+- **实现进展：** Resolver 校验 Manifest 依赖时按依赖 ID、版本范围排序，使多个错误同时存在时选出的诊断不依赖 JSON 数组顺序；LoadPlan 中依赖 ID 已排序。提交 `a872a1c` 已通过本地 `cargo check --locked --workspace` 与 Gitee Go。
+- **验收缺口：** 尚需覆盖候选输入顺序置换、重复 Mod ID、重复依赖、版本不匹配、自依赖/多节点循环及其稳定错误关联信息，再按本卡门禁完成验收。
 - **未决边界：** 多版本 side-by-side、可选依赖和 Mod 间公开 API 依赖仍不支持。
