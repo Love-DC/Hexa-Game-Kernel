@@ -65,19 +65,19 @@
 
 P2 完成前不新增并行 System 执行、跨版本重放承诺、存档迁移器或更宽权限 API；分别留给后续阶段处理。
 
-## 4. 首轮实现与验收记录（2026-10-13）
+## 4. 实现与验收记录（2026-10-13）
 
-本轮只把有代码和执行证据的内容标为已实现/已验收；P2 尚未整体验收。
+首轮实现和本地补充验收已完成。P2 的合同覆盖仍不完整，因此不将整个 P2 标为已验收。
 
 | 项 | 本轮状态 | 证据与缺口 |
 |---|---|---|
-| P2-01 | 部分实现 | Kernel 与 Platform 错误提供稳定命名空间码；公共类型归属、边界和完整错误恢复表还需独立契约文档。 |
-| P2-02 | 已实现，待远端验收 | `counter_read` 要求 `world.read`，`counter_set` 要求 `world.command`；Manifest 请求、宿主授权、导入 allow-list 均在实例注册前检查；自动测试覆盖缺少写权限。未知导入沿用拒绝路径。 |
-| P2-03 | 部分实现 | Command 拒绝有稳定码；实体查询新增只读稳定顺序迭代器。当前仍缺旧 generation/跨 World/allocator 溢出等逐项测试和完整的提交边界故障注入。 |
-| P2-04 | 已实现，待扩展验收 | StateHash 使用 v2 规范二进制域与稳定排序；本地黄金摘要覆盖资源整数/文本与插入顺序，尚未覆盖所有 Entity/ComponentValue 组合，也未比较不同操作系统产物。 |
-| P2-05 | 已实现，待扩展验收 | Snapshot v2 magic/version、v1 拒绝、未知字段、重复资源键、摘要错配已有测试；重复实体、重复组件、无效世界和截断输入仍可增加针对性断言。快照不包括 System/Mod 实例及输入日志。 |
-| P2-06 | 部分实现 | Kernel/Platform 顶层错误与 Command rejection 已有稳定码；仍需明确每类故障恢复语义，并覆盖故障状态、错误码及不会提交暂存 Tick 的测试。 |
-| P2-07 | 本地门禁已通过；Gitee Go 待本次提交验证 | 本地运行记录见下；本轮改动还未推送，因此没有本轮远端 CI 证据。 |
+| P2-01 | 部分实现 | Kernel 与 Platform 错误提供稳定命名空间码；完整公共类型归属和字段边界仍需单独 API 契约表。 |
+| P2-02 | 已实现，已验收 | `counter_read` 要求 `world.read`，`counter_set` 要求 `world.command`；Manifest 请求、宿主授权、导入 allow-list 均在实例注册前检查；自动测试覆盖缺少写权限和未知导入拒绝；Gitee Go 已通过。 |
+| P2-03 | 已实现，已验收 | 稳定只读实体遍历；跨 World、错误 generation、缺失实体、allocator 溢出的稳定拒绝码；外部命令单条拒绝不阻断后续有效命令；System 故障回滚 Tick。 |
+| P2-04 | 已实现，已验收（单一锁定环境） | StateHash 黄金向量覆盖 World 身份/Tick/分配器、Entity ID、资源及组件的 Integer/Boolean/Text；逆序插入得到相同摘要。未比较不同操作系统产物。 |
+| P2-05 | 已实现，已验收 | Snapshot v2 magic/version、v1 拒绝、未知字段、重复资源/组件键、重复实体 ID、非法 World、摘要错配和截断 JSON 均有拒绝测试；快照不包括 System/Mod 实例及输入日志。 |
+| P2-06 | 部分实现 | Kernel/Platform 顶层错误与 Command rejection 有稳定码；Kernel System 故障/故障态码及不提交暂存 Tick 有测试。Platform Mod trap 的恢复路径已由集成测试覆盖，但稳定的诊断分类与复现报告格式仍需完成。 |
+| P2-07 | Windows 本地与 Gitee Go Linux 检查通过；整体阶段仍待验收 | 本地执行记录见下。负责人提供的 Gitee Go 页面截图显示提交 `e69e1ad` Webhook 构建成功。跨平台黄金摘要尚未执行，不能据此承诺跨 OS 确定性。 |
 
 ### 本地执行记录
 
@@ -87,9 +87,18 @@ P2 完成前不新增并行 System 执行、跨版本重放承诺、存档迁移
 - `cargo run --locked -p game-platform -- demo`：通过；演示输出 3 个 Tick 且 `verified=true`。
 - 当前环境：Windows 本地工作区；未用跨平台黄金夹具比较云端 Linux 和本地的同一状态摘要。
 
+### 故障恢复语义
+
+| 类别 | 可观察结果 | 恢复方式 |
+|---|---|---|
+| 单条外部 Command 被拒绝 | `CommandRejectionCode`；拒绝只影响该命令，后续命令仍处理，Tick 可继续完成。 | 修正命令内容/身份后，以有效权威输入重试；原拒绝不回滚其他已接受命令。 |
+| System 执行失败或产生非法命令 | Kernel 返回稳定 `KernelErrorCode`，Tick 暂存状态不提交，Kernel 进入 Faulted 状态。 | 从故障前快照创建新 Kernel，并由调用方重新注册相同 System；先修复失败源再继续。 |
+| Mod 加载/运行失败 | Platform 加载错误码，或 Kernel 的 System failure；当前 Mod 实例不得继续推进模拟。 | 修正包/权限，或从故障前快照重建 Kernel 与 Platform 运行时。 |
+| Snapshot 格式、数据或摘要错误 | `KernelError::code()` 返回稳定快照错误分类；恢复函数不返回半初始化 Kernel。 | 保留原始快照并从可信副本恢复；不得忽略摘要错误或将其当成空 World。 |
+
 ## 5. 后续验收门槛
 
-先补齐 P2-03/05/06 的针对性故障与拒绝测试，以及包含 Entity、全部 ComponentValue 类型的 StateHash 固定向量；再推送后核对 Gitee Go 结果。跨 OS/架构确定性仍是明确未验证项，不作为本轮承诺。
+下一步补齐 P2-01 的正式 Kernel API 类型/字段契约表，以及 P2-06 Platform Mod trap 的稳定诊断码与复现报告格式。跨 OS/架构确定性仍是明确未验证项，不作为本轮承诺。
 
 ## 6. 已批准的兼容决定
 

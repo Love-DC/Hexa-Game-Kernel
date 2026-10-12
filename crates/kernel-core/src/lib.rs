@@ -969,6 +969,89 @@ mod tests {
     }
 
     #[test]
+    fn entity_identity_errors_have_distinct_stable_codes() {
+        let mut kernel = seeded_kernel(0);
+        let output = kernel
+            .step(StepInput {
+                commands: vec![
+                    command(
+                        0,
+                        Command::DespawnEntity {
+                            entity: EntityId {
+                                world: WorldId(8),
+                                index: 0,
+                                generation: 0,
+                            },
+                        },
+                    ),
+                    command(
+                        1,
+                        Command::DespawnEntity {
+                            entity: EntityId {
+                                world: WorldId(7),
+                                index: 0,
+                                generation: 1,
+                            },
+                        },
+                    ),
+                    command(
+                        2,
+                        Command::DespawnEntity {
+                            entity: EntityId {
+                                world: WorldId(7),
+                                index: 0,
+                                generation: 0,
+                            },
+                        },
+                    ),
+                ],
+            })
+            .unwrap();
+
+        assert_eq!(
+            output
+                .rejected_commands
+                .iter()
+                .map(|rejection| rejection.code)
+                .collect::<Vec<_>>(),
+            [
+                CommandRejectionCode::CrossWorldEntity,
+                CommandRejectionCode::InvalidEntityGeneration,
+                CommandRejectionCode::MissingEntity
+            ]
+        );
+        assert_eq!(
+            output.rejected_commands[0].code.as_str(),
+            "world.cross_world_entity"
+        );
+        let serialized = serde_json::to_value(&output.rejected_commands[0]).unwrap();
+        assert_eq!(serialized["code"], "world.cross_world_entity");
+    }
+
+    #[test]
+    fn entity_allocator_overflow_is_a_stable_command_rejection() {
+        let mut world = World::new(WorldId(7));
+        world.next_entity_index = u64::MAX;
+        let mut kernel = Kernel::new(world).unwrap();
+        let output = kernel
+            .step(StepInput {
+                commands: vec![command(
+                    0,
+                    Command::SpawnEntity {
+                        components: BTreeMap::new(),
+                    },
+                )],
+            })
+            .unwrap();
+
+        assert_eq!(
+            output.rejected_commands[0].code,
+            CommandRejectionCode::EntityIdExhausted
+        );
+        assert_eq!(kernel.world().entity_count(), 0);
+    }
+
+    #[test]
     fn duplicate_command_id_is_rejected() {
         let mut kernel = seeded_kernel(0);
         let envelope = command(
@@ -1138,29 +1221,130 @@ mod tests {
             Kernel::from_snapshot(duplicate_resource_key),
             Err(KernelError::Serialization(_))
         ));
+
+        let duplicate_component_key = br#"{
+            "magic":"GAME_KERNEL_SNAPSHOT",
+            "format_version":2,
+            "world":{"id":7,"tick":0,"next_entity_index":1,"entities":[{
+                "id":{"world":7,"index":0,"generation":0},
+                "components":{
+                    "org.game/health":{"kind":"integer","value":1},
+                    "org.game/health":{"kind":"integer","value":2}
+                }
+            }],"resources":{}},
+            "state_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+        assert!(matches!(
+            Kernel::from_snapshot(duplicate_component_key),
+            Err(KernelError::Serialization(_))
+        ));
+
+        let duplicate_entity_id = br#"{
+            "magic":"GAME_KERNEL_SNAPSHOT",
+            "format_version":2,
+            "world":{"id":7,"tick":0,"next_entity_index":1,"entities":[
+                {"id":{"world":7,"index":0,"generation":0},"components":{}},
+                {"id":{"world":7,"index":0,"generation":0},"components":{}}
+            ],"resources":{}},
+            "state_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+        assert!(matches!(
+            Kernel::from_snapshot(duplicate_entity_id),
+            Err(KernelError::Serialization(_))
+        ));
+        assert!(matches!(
+            Kernel::from_snapshot(br#"{"magic":"GAME_KERNEL_SNAPSHOT""#),
+            Err(KernelError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_entity_that_does_not_belong_to_its_world() {
+        let invalid_world = br#"{
+            "magic":"GAME_KERNEL_SNAPSHOT",
+            "format_version":2,
+            "world":{"id":7,"tick":0,"next_entity_index":1,"entities":[{
+                "id":{"world":8,"index":0,"generation":0},"components":{}
+            }],"resources":{}},
+            "state_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+        assert!(matches!(
+            Kernel::from_snapshot(invalid_world),
+            Err(KernelError::InvalidSnapshotWorld(_))
+        ));
     }
 
     #[test]
     fn state_hash_uses_canonical_v2_encoding() {
         let mut first = World::new(WorldId(7));
+        first.tick = Tick(4);
+        first.next_entity_index = 6;
         first
             .seed_resource("org.game/counter", ComponentValue::Integer(9))
             .unwrap();
         first
             .seed_resource("org.game/name", ComponentValue::Text("kernel".to_owned()))
             .unwrap();
+        first
+            .seed_resource("org.game/ready", ComponentValue::Boolean(true))
+            .unwrap();
+        let entity_id = EntityId {
+            world: WorldId(7),
+            index: 5,
+            generation: 0,
+        };
+        first.entities.insert(
+            entity_id,
+            Entity {
+                id: entity_id,
+                components: BTreeMap::from([
+                    ("org.game/count".to_owned(), ComponentValue::Integer(-3)),
+                    (
+                        "org.game/enabled".to_owned(),
+                        ComponentValue::Boolean(false),
+                    ),
+                    (
+                        "org.game/label".to_owned(),
+                        ComponentValue::Text("unit".to_owned()),
+                    ),
+                ]),
+            },
+        );
         let mut second = World::new(WorldId(7));
+        second.tick = Tick(4);
+        second.next_entity_index = 6;
+        second
+            .resources
+            .insert("org.game/ready".to_owned(), ComponentValue::Boolean(true));
         second
             .seed_resource("org.game/name", ComponentValue::Text("kernel".to_owned()))
             .unwrap();
         second
             .seed_resource("org.game/counter", ComponentValue::Integer(9))
             .unwrap();
+        let components = BTreeMap::from([
+            (
+                "org.game/label".to_owned(),
+                ComponentValue::Text("unit".to_owned()),
+            ),
+            (
+                "org.game/enabled".to_owned(),
+                ComponentValue::Boolean(false),
+            ),
+            ("org.game/count".to_owned(), ComponentValue::Integer(-3)),
+        ]);
+        second.entities.insert(
+            entity_id,
+            Entity {
+                id: entity_id,
+                components,
+            },
+        );
 
         assert_eq!(state_hash(&first).unwrap(), state_hash(&second).unwrap());
         assert_eq!(
             state_hash(&first).unwrap().to_hex(),
-            "f69668c3f54968dbd210921fa8eb9c19965ebbe9a84c20482a4d40414be3d830"
+            "ed40c73c2133356f32f4ae4f72834c1e74b1aacae74a2033b1f4976aaa77b5e0"
         );
     }
 
@@ -1193,12 +1377,15 @@ mod tests {
             )],
         });
 
-        assert!(matches!(result, Err(KernelError::SystemFailed(_))));
+        assert!(matches!(&result, Err(KernelError::SystemFailed(_))));
+        assert_eq!(
+            result.as_ref().unwrap_err().code().as_str(),
+            "kernel.system_failed"
+        );
         assert_eq!(kernel.world().tick(), Tick(0));
         assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(1));
-        assert!(matches!(
-            kernel.step(StepInput::default()),
-            Err(KernelError::Faulted(_))
-        ));
+        let faulted = kernel.step(StepInput::default());
+        assert!(matches!(&faulted, Err(KernelError::Faulted(_))));
+        assert_eq!(faulted.unwrap_err().code().as_str(), "kernel.faulted");
     }
 }
