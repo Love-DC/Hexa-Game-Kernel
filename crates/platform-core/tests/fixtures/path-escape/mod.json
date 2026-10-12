@@ -1,0 +1,8 @@
+{
+  "manifest_version": 1,
+  "id": "org.game.path-escape",
+  "version": "0.1.0",
+  "kernel_api": "0.1",
+  "entrypoint": "../p1-counter/counter.wat",
+  "requested_permissions": []
+}

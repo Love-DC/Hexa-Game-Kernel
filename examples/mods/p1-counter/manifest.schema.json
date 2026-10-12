@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/mod-manifest-v1.json",
+  "title": "Game Kernel P1 Mod Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "id",
+    "version",
+    "kernel_api",
+    "entrypoint",
+    "requested_permissions"
+  ],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "kernel_api": { "const": "0.1" },
+    "entrypoint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+\\.(wasm|wat)$"
+    },
+    "requested_permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["world.read", "world.command"]
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)*$"
+          },
+          "version": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
