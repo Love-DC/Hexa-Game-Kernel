@@ -1,7 +1,7 @@
 # P3 任务卡：Mod Platform 基线
 
 - 阶段：P3
-- 状态：阶段规划草案；建议先兼容当前 P1 包、权限默认拒绝、无热重载；具体实施按任务卡依赖推进
+- 状态：P3 执行中；GK-P3-01 本地验收通过，Gitee Go 待本次提交确认
 - 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
 - 当前代码基线：`crates/platform-core` 包含严格 JSON Manifest 解析、本地目录发现、必需依赖 SemVer 校验、确定性拓扑解析、内存 LoadPlan、宿主权限授权和 Wasmtime 适配；目前仅有 `gk::counter_read` / `gk::counter_set` 两个 Host API。
 - 规范边界：仓库内独立的 `Mod Platform Specification v1.0.md` 是空文件；本卡以完整项目规范为依据。不得静默填充空文件或将未决字段假装成既有契约。
@@ -72,6 +72,17 @@
 ## 依赖与顺序
 
 `P3-01 → P3-02 → P3-03`；`P3-01 → P3-04 → P3-05`；`P3-05 → P3-06`；全部汇入 `P3-07`。实现 API Registry 前先冻结其 descriptor；实现 Lifecycle 前先定义状态转换和批次事务，避免并行改动同一公共契约。
+
+## 执行记录
+
+### GK-P3-01 — Manifest v1 Schema 与诊断
+
+- **状态：** 本地验收通过，远端 CI 待确认。
+- **实现：** 新增唯一规范 Schema `schemas/mod-manifest-v1.schema.json`，Platform 加载 Manifest 时先执行 Schema 校验，再执行 Rust 语义校验。错误使用稳定 `platform.invalid_manifest` 码，Schema 错误包含 JSON Pointer 字段路径；内置 Schema 加载失败使用 `platform.invalid_schema`。
+- **对齐：** 保持 P1 现有字段、默认空依赖、未知字段拒绝和两个既有权限；示例 Schema 与规范 Schema 通过测试保持逐字节一致。语义校验覆盖 SemVer、依赖范围和跨平台入口路径约束。
+- **测试：** Schema Draft 2020-12 元校验、示例包通过、未知字段和重复权限拒绝、ID/SemVer/权限/依赖范围非法拒绝、绝对路径/遍历/反斜线/无效扩展拒绝。
+- **本地门禁：** `cargo fmt --all -- --check`、`cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo test --locked --workspace`、`cargo run --locked -p game-platform -- demo` 均通过。Platform 12 项、Kernel 14 项、集成 3 项测试通过；demo 输出 `verified=true`。
+- **剩余：** Gitee Go 需验证全新 `jsonschema` 依赖在云端 Linux 可锁定构建；Manifest 其他字段保持未支持，不由此 Schema 推断。
 
 ## 本阶段明确不做
 

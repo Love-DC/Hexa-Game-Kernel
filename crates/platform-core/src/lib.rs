@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use kernel_core::{Command, ComponentValue, System, SystemError, Tick, World};
 use semver::{Version, VersionReq};
@@ -110,6 +110,8 @@ pub enum PlatformError {
     WasmModule { mod_id: String, message: String },
     #[error("failed to encode load plan: {0}")]
     Serialization(String),
+    #[error("invalid embedded schema: {0}")]
+    InvalidSchema(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +125,7 @@ pub enum PlatformErrorCode {
     RuntimeSetup,
     WasmModule,
     Serialization,
+    InvalidSchema,
 }
 
 impl PlatformErrorCode {
@@ -137,6 +140,7 @@ impl PlatformErrorCode {
             Self::RuntimeSetup => "platform.runtime_setup",
             Self::WasmModule => "platform.wasm_module",
             Self::Serialization => "platform.serialization",
+            Self::InvalidSchema => "platform.invalid_schema",
         }
     }
 }
@@ -153,6 +157,7 @@ impl PlatformError {
             Self::RuntimeSetup(_) => PlatformErrorCode::RuntimeSetup,
             Self::WasmModule { .. } => PlatformErrorCode::WasmModule,
             Self::Serialization(_) => PlatformErrorCode::Serialization,
+            Self::InvalidSchema(_) => PlatformErrorCode::InvalidSchema,
         }
     }
 }
@@ -180,36 +185,20 @@ impl ModPackage {
         }
         let manifest_bytes =
             fs::read(&manifest_path).map_err(|error| io_error(&manifest_path, error))?;
-        let manifest: ModManifest = serde_json::from_slice(&manifest_bytes)
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| PlatformError::InvalidManifest(error.to_string()))?;
+        validate_manifest_schema(&manifest_value)?;
+        let manifest: ModManifest = serde_json::from_value(manifest_value)
             .map_err(|error| PlatformError::InvalidManifest(error.to_string()))?;
         validate_manifest(&manifest)?;
 
+        validate_entrypoint_path(&manifest.entrypoint).map_err(PlatformError::InvalidManifest)?;
         let relative_entry = Path::new(&manifest.entrypoint);
-        if relative_entry.as_os_str().is_empty()
-            || relative_entry.is_absolute()
-            || relative_entry
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(PlatformError::InvalidManifest(
-                "entrypoint must be a non-empty relative path without `.` or `..` components"
-                    .to_owned(),
-            ));
-        }
         let module_path = canonicalize(&root.join(relative_entry))?;
         ensure_inside(&root, &module_path)?;
         if !module_path.is_file() {
             return Err(PlatformError::InvalidPackage(
                 "entrypoint does not refer to a file".to_owned(),
-            ));
-        }
-        let extension = module_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if !matches!(extension, "wasm" | "wat") {
-            return Err(PlatformError::InvalidManifest(
-                "entrypoint must end in `.wasm` or development-only `.wat`".to_owned(),
             ));
         }
         let module_size = fs::metadata(&module_path)
@@ -668,6 +657,55 @@ fn validate_manifest(manifest: &ModManifest) -> Result<(), PlatformError> {
     Ok(())
 }
 
+fn validate_manifest_schema(value: &serde_json::Value) -> Result<(), PlatformError> {
+    static VALIDATOR: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/mod-manifest-v1.schema.json"))
+                .map_err(|error| error.to_string())?;
+        jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+    });
+    let validator = validator
+        .as_ref()
+        .map_err(|error| PlatformError::InvalidSchema(error.clone()))?;
+    if let Err(error) = validator.validate(value) {
+        return Err(PlatformError::InvalidManifest(format!(
+            "manifest schema violation at `{}`: {error}",
+            error.instance_path()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_entrypoint_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 240
+        || path.is_absolute()
+        || value
+            .chars()
+            .any(|character| matches!(character, '\\' | ':'))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(
+            "entrypoint must be a portable relative path without `.` or `..` components".to_owned(),
+        );
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !matches!(extension, "wasm" | "wat") {
+        return Err("entrypoint must end in `.wasm` or development-only `.wat`".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_mod_id(id: &str) -> Result<(), PlatformError> {
     let valid = !id.is_empty()
         && id.len() <= 128
@@ -754,6 +792,87 @@ mod tests {
 
     fn sample_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mods/p1-counter")
+    }
+
+    #[test]
+    fn manifest_v1_schema_is_valid_and_accepts_the_sample() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/mod-manifest-v1.schema.json"))
+                .unwrap();
+        assert!(jsonschema::meta::validate(&schema).is_ok());
+
+        let package = ModPackage::load(sample_root()).unwrap();
+        let manifest = serde_json::to_value(&package.manifest).unwrap();
+        assert!(validate_manifest_schema(&manifest).is_ok());
+
+        let example_schema =
+            fs::read_to_string(sample_root().join("manifest.schema.json")).unwrap();
+        assert_eq!(
+            example_schema,
+            include_str!("../../../schemas/mod-manifest-v1.schema.json")
+        );
+
+        let mut invalid = manifest;
+        invalid["unknown_field"] = serde_json::Value::Bool(true);
+        let error = validate_manifest_schema(&invalid).unwrap_err();
+        assert_eq!(error.code().as_str(), "platform.invalid_manifest");
+        assert!(error.to_string().contains("unknown_field"));
+
+        let mut duplicate_permissions: serde_json::Value =
+            serde_json::to_value(&ModPackage::load(sample_root()).unwrap().manifest).unwrap();
+        duplicate_permissions["requested_permissions"] =
+            serde_json::json!(["world.read", "world.read"]);
+        assert!(validate_manifest_schema(&duplicate_permissions).is_err());
+    }
+
+    #[test]
+    fn manifest_entrypoint_paths_are_portable_and_confined() {
+        assert!(validate_entrypoint_path("module.wasm").is_ok());
+        assert!(validate_entrypoint_path("scripts/module.wat").is_ok());
+        for invalid in [
+            "",
+            "/tmp/module.wasm",
+            "C:\\mods\\module.wasm",
+            "../module.wasm",
+            "scripts/../module.wasm",
+            "scripts//module.wasm",
+            "scripts\\module.wasm",
+            "module.dll",
+        ] {
+            assert!(
+                validate_entrypoint_path(invalid).is_err(),
+                "accepted entrypoint path `{invalid}`"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_semantic_validation_rejects_invalid_ids_versions_and_permissions() {
+        let base = ModPackage::load(sample_root()).unwrap().manifest;
+
+        let mut invalid = base.clone();
+        invalid.id = "org..game".to_owned();
+        assert_eq!(
+            validate_manifest(&invalid).unwrap_err().code().as_str(),
+            "platform.invalid_manifest"
+        );
+
+        let mut invalid = base.clone();
+        invalid.version = "01.0.0".to_owned();
+        assert!(validate_manifest(&invalid).is_err());
+
+        let mut invalid = base.clone();
+        invalid
+            .requested_permissions
+            .insert("world.admin".to_owned());
+        assert!(validate_manifest(&invalid).is_err());
+
+        let mut invalid = base;
+        invalid.dependencies.push(ModDependency {
+            id: "org.game.other".to_owned(),
+            version: "not a version range".to_owned(),
+        });
+        assert!(validate_manifest(&invalid).is_err());
     }
 
     #[test]

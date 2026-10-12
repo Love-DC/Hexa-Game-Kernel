@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/mod-manifest-v1.schema.json",
+  "title": "Game Kernel Mod Manifest v1",
+  "description": "Structural schema for the currently supported ModManifest v1 subset. Semantic path, ID, SemVer and permission checks are also enforced by Platform.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "id",
+    "version",
+    "kernel_api",
+    "entrypoint",
+    "requested_permissions"
+  ],
+  "properties": {
+    "manifest_version": { "const": 1 },
+    "id": { "$ref": "#/$defs/mod_id" },
+    "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "kernel_api": { "const": "0.1" },
+    "entrypoint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^.+\\.(wasm|wat)$"
+    },
+    "requested_permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["world.read", "world.command"] }
+    },
+    "dependencies": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "version"],
+        "properties": {
+          "id": { "$ref": "#/$defs/mod_id" },
+          "version": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "mod_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)*$"
+    }
+  }
+}
