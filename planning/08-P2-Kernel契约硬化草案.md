@@ -51,6 +51,32 @@
 - 稳定错误码与面向用户的诊断文本分开：测试和机器协议依赖错误码，不依赖字符串措辞。
 - 在没有调度访问描述符前继续串行执行；不因“只读”接口而推断可以并行。
 
+### 2.5 公共 API 所有权与字段边界（P2-01）
+
+Kernel crate 是以下权威类型的唯一所有者；Platform 只实现 `System` 并将 Mod 输出转换为 `Command`，不复制或直接修改这些类型的状态。
+
+| 类型/API | 唯一所有者 | 对外字段/边界 |
+|---|---|---|
+| `Tick(u64)`、`WorldId(u64)` | Kernel | 有序、固定宽度标识；Tick 只由成功的 `Kernel::step` 增加。 |
+| `EntityId { world, index, generation }` | Kernel | 三元身份；index 按 World 单调分配、不复用；generation 当前固定为 0。 |
+| `ComponentValue` | Kernel | 仅 Integer(i64)、Boolean、Text(String)；没有浮点。 |
+| `Entity` | Kernel | 公开只读 `id` 与 `component(type_id)`；组件容器不可变更或直接暴露。 |
+| `World` | Kernel | 状态字段私有；公开 `id/tick/entity_count/entities/entity/resource/resource_i64` 只读查询。`seed_resource` 仅用于交给 Kernel 前构造初始状态。 |
+| `CommandId`、`CommandEnvelope`、`Command` | Kernel | 权威写入请求；目标 Tick、来源、序号组成身份；所有运行期写入只通过这些命令。 |
+| `CommandRejectionCode`、`CommandRejection` | Kernel | 拒绝码稳定且机器可读；`reason` 仅供诊断，不作协议匹配。 |
+| `EventKind`、`EventRecord` | Kernel | 成功提交命令产生的有序事件；不是独立的可变状态入口。 |
+| `StateHash([u8; 32])` | Kernel | v2 规范逻辑状态的 SHA-256；`to_hex` 输出小写 64 位十六进制。 |
+| `StepInput`、`StepOutput` | Kernel | 输入只有命令批次；输出包含成功 Tick、提交/拒绝命令、事件和该 Tick 状态摘要。 |
+| `System`、`SystemError` | Kernel | System 只获得 `&World` 与当前 Tick，并返回命令；错误报告 v1 字段为 `format_version/code/system/tick/source_digest/message`。 |
+| `KernelError`、`KernelErrorCode` | Kernel | 每个 Kernel 顶层失败有稳定 `kernel.*` 码；人类诊断文本可变。 |
+| `ModManifest`、`ModDependency`、`ModPackage` | Platform | 包声明、依赖与验证后的内容；包外路径拒绝；运行权限不能由 Mod 自己授予。 |
+| `LockedMod`、`LoadPlan` | Platform | 锁定内容摘要、依赖、Kernel API、运行时和配置摘要；相同输入生成相同计划。 |
+| `PlatformError`、`PlatformErrorCode` | Platform | 加载、校验、权限、解析和运行时初始化错误；错误码稳定、消息可变。 |
+| `LoadedWasmMod`、`WasmSystem` | Platform | 受限 Wasm 适配器；只允许 manifest 声明且宿主授权的 allow-list API；不暴露 World 引用给 guest。 |
+| `ModFailureCode` | Platform | Runtime setup、执行失败、无效输出、无效 World 状态的稳定 `platform.mod.*` 分类。 |
+
+兼容规则：序列化的 Snapshot envelope v2 与 `SystemError` 报告 v1 对未知字段严格拒绝；改变字段含义、编码或删除字段必须提升对应格式版本。新增 Rust 公共字段属于源码兼容性变化，应同步更新此表、构造器、示例和集成测试。
+
 ## 3. P2 工作分解与验收
 
 | 项 | 工作 | 验收证据 |
@@ -71,19 +97,19 @@ P2 完成前不新增并行 System 执行、跨版本重放承诺、存档迁移
 
 | 项 | 本轮状态 | 证据与缺口 |
 |---|---|---|
-| P2-01 | 部分实现 | Kernel 与 Platform 错误提供稳定命名空间码；完整公共类型归属和字段边界仍需单独 API 契约表。 |
+| P2-01 | 已实现，待 CI 验收 | 公共 Kernel/Platform 类型唯一归属与字段边界见 §2.5；`SystemError` 报告格式 v1 有版本字段和稳定码。 |
 | P2-02 | 已实现，已验收 | `counter_read` 要求 `world.read`，`counter_set` 要求 `world.command`；Manifest 请求、宿主授权、导入 allow-list 均在实例注册前检查；自动测试覆盖缺少写权限和未知导入拒绝；Gitee Go 已通过。 |
 | P2-03 | 已实现，已验收 | 稳定只读实体遍历；跨 World、错误 generation、缺失实体、allocator 溢出的稳定拒绝码；外部命令单条拒绝不阻断后续有效命令；System 故障回滚 Tick。 |
 | P2-04 | 已实现，已验收（单一锁定环境） | StateHash 黄金向量覆盖 World 身份/Tick/分配器、Entity ID、资源及组件的 Integer/Boolean/Text；逆序插入得到相同摘要。未比较不同操作系统产物。 |
 | P2-05 | 已实现，已验收 | Snapshot v2 magic/version、v1 拒绝、未知字段、重复资源/组件键、重复实体 ID、非法 World、摘要错配和截断 JSON 均有拒绝测试；快照不包括 System/Mod 实例及输入日志。 |
-| P2-06 | 部分实现 | Kernel/Platform 顶层错误与 Command rejection 有稳定码；Kernel System 故障/故障态码及不提交暂存 Tick 有测试。Platform Mod trap 的恢复路径已由集成测试覆盖，但稳定的诊断分类与复现报告格式仍需完成。 |
-| P2-07 | Windows 本地与 Gitee Go Linux 检查通过；整体阶段仍待验收 | 本地执行记录见下。负责人提供的 Gitee Go 页面截图显示提交 `e69e1ad` Webhook 构建成功。跨平台黄金摘要尚未执行，不能据此承诺跨 OS 确定性。 |
+| P2-06 | 已实现，待 CI 验收 | Kernel System 错误报告 v1 携带稳定 `platform.mod.*` 分类、失败 Tick、Mod 内容摘要和诊断信息；燃料环集成用例验证 Trap 的错误码、报告序列化与 Tick 回滚。故障后必须重建 Kernel/Mod runtime。 |
+| P2-07 | Windows 本地与 Gitee Go Linux 检查通过；本批改动 CI 待确认 | 负责人确认提交 `e6fcbdd` 的 Gitee Go 构建成功。当前未比较跨平台黄金摘要，不能据此承诺跨 OS 确定性。 |
 
 ### 本地执行记录
 
 - `cargo fmt --all -- --check`：通过。
 - `cargo clippy --locked --workspace --all-targets -- -D warnings`：通过。
-- `cargo test --locked --workspace`：通过；Kernel、Platform、集成与文档测试均通过。
+- `cargo test --locked --workspace`：通过；Kernel 14 项、Platform 9 项、集成 3 项及文档测试通过。
 - `cargo run --locked -p game-platform -- demo`：通过；演示输出 3 个 Tick 且 `verified=true`。
 - 当前环境：Windows 本地工作区；未用跨平台黄金夹具比较云端 Linux 和本地的同一状态摘要。
 
@@ -98,7 +124,7 @@ P2 完成前不新增并行 System 执行、跨版本重放承诺、存档迁移
 
 ## 5. 后续验收门槛
 
-下一步补齐 P2-01 的正式 Kernel API 类型/字段契约表，以及 P2-06 Platform Mod trap 的稳定诊断码与复现报告格式。跨 OS/架构确定性仍是明确未验证项，不作为本轮承诺。
+本批改动通过 Gitee Go 后，P2 的实现项即完成；阶段仍保留跨 OS/架构黄金摘要为未执行的边界验证，当前确定性承诺仅限同一锁定受支持配置。跨 OS/架构确定性仍不是本轮承诺。
 
 ## 6. 已批准的兼容决定
 

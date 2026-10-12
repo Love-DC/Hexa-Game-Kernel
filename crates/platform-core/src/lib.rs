@@ -1,5 +1,5 @@
-//! Minimal Platform layer: package discovery, strict manifest validation,
-//! deterministic dependency locking, and a restricted Wasm-to-Kernel adapter.
+//! Platform layer: package discovery, strict manifest validation, deterministic
+//! dependency locking, and a restricted Wasm-to-Kernel adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -25,6 +25,25 @@ const MAX_LINEAR_MEMORY_BYTES: usize = 64 * 1024;
 const FUEL_PER_TICK: u64 = 10_000;
 const MAX_WASM_STACK_BYTES: usize = 256 * 1024;
 const COUNTER_RESOURCE: &str = "org.game/counter";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModFailureCode {
+    RuntimeSetup,
+    ExecutionFailed,
+    InvalidOutput,
+    InvalidWorldState,
+}
+
+impl ModFailureCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeSetup => "platform.mod.runtime_setup",
+            Self::ExecutionFailed => "platform.mod.execution_failed",
+            Self::InvalidOutput => "platform.mod.invalid_output",
+            Self::InvalidWorldState => "platform.mod.invalid_world_state",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -449,6 +468,7 @@ impl LoadedWasmMod {
             id: self.id.clone(),
             engine: self.engine.clone(),
             module: Arc::clone(&self.module),
+            content_digest: self.content_digest.clone(),
         }
     }
 }
@@ -457,6 +477,7 @@ pub struct WasmSystem {
     id: String,
     engine: Engine,
     module: Arc<Module>,
+    content_digest: String,
 }
 
 impl System for WasmSystem {
@@ -464,33 +485,41 @@ impl System for WasmSystem {
         &self.id
     }
 
-    fn execute(&self, world: &World, _tick: Tick) -> Result<Vec<Command>, SystemError> {
+    fn execute(&self, world: &World, tick: Tick) -> Result<Vec<Command>, SystemError> {
         let current_counter = match world.resource(COUNTER_RESOURCE) {
             None => 0,
             Some(ComponentValue::Integer(value)) => *value,
             Some(_) => {
-                return Err(system_error(
-                    &self.id,
+                return Err(self.system_error(
+                    tick,
+                    ModFailureCode::InvalidWorldState,
                     "counter Resource must contain an integer",
                 ));
             }
         };
         let mut store = new_store(&self.engine, current_counter)
-            .map_err(|error| system_error(&self.id, error))?;
-        let linker = new_linker(&self.engine).map_err(|error| system_error(&self.id, error))?;
+            .map_err(|error| self.system_error(tick, ModFailureCode::RuntimeSetup, error))?;
+        let linker = new_linker(&self.engine)
+            .map_err(|error| self.system_error(tick, ModFailureCode::RuntimeSetup, error))?;
         let instance = linker
             .instantiate(&mut store, &self.module)
-            .map_err(|error| system_error(&self.id, error.to_string()))?;
-        let tick = instance
+            .map_err(|error| {
+                self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
+            })?;
+        let on_tick = instance
             .get_typed_func::<(), ()>(&mut store, "on_tick")
-            .map_err(|error| system_error(&self.id, error.to_string()))?;
-        tick.call(&mut store, ())
-            .map_err(|error| system_error(&self.id, error.to_string()))?;
+            .map_err(|error| {
+                self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
+            })?;
+        on_tick.call(&mut store, ()).map_err(|error| {
+            self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
+        })?;
 
         let state = store.data();
         if state.write_violation {
-            return Err(system_error(
-                &self.id,
+            return Err(self.system_error(
+                tick,
+                ModFailureCode::InvalidOutput,
                 "Mod attempted more than one counter write in a Tick",
             ));
         }
@@ -503,6 +532,18 @@ impl System for WasmSystem {
                 }]
             })
             .unwrap_or_default())
+    }
+}
+
+impl WasmSystem {
+    fn system_error(
+        &self,
+        tick: Tick,
+        code: ModFailureCode,
+        message: impl Into<String>,
+    ) -> SystemError {
+        SystemError::new(&self.id, tick, code.as_str(), message)
+            .with_source_digest(self.content_digest.clone())
     }
 }
 
@@ -687,16 +728,29 @@ fn io_error(path: &Path, error: std::io::Error) -> PlatformError {
     }
 }
 
-fn system_error(system: &str, message: impl Into<String>) -> SystemError {
-    SystemError {
-        system: system.to_owned(),
-        message: message.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mod_failure_codes_are_stable_and_namespaced() {
+        assert_eq!(
+            ModFailureCode::RuntimeSetup.as_str(),
+            "platform.mod.runtime_setup"
+        );
+        assert_eq!(
+            ModFailureCode::ExecutionFailed.as_str(),
+            "platform.mod.execution_failed"
+        );
+        assert_eq!(
+            ModFailureCode::InvalidOutput.as_str(),
+            "platform.mod.invalid_output"
+        );
+        assert_eq!(
+            ModFailureCode::InvalidWorldState.as_str(),
+            "platform.mod.invalid_world_state"
+        );
+    }
 
     fn sample_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mods/p1-counter")

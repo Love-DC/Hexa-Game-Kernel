@@ -1,4 +1,4 @@
-//! Minimal authoritative simulation Kernel for the P1 vertical slice.
+//! Deterministic authoritative simulation Kernel with versioned P2 contracts.
 //!
 //! This crate intentionally has no dependency on Platform, Wasmtime, files, or networking.
 
@@ -349,11 +349,42 @@ pub struct StepOutput {
     pub state_hash: StateHash,
 }
 
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-#[error("system `{system}` failed: {message}")]
+/// Versioned, serializable diagnostic returned when a System cannot produce a Tick result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Error)]
+#[serde(deny_unknown_fields)]
+#[error("system `{system}` failed ({code}): {message}")]
 pub struct SystemError {
+    pub format_version: u32,
+    /// Stable namespaced code. Diagnostic text is not a machine-readable contract.
+    pub code: String,
     pub system: String,
+    pub tick: Tick,
+    /// Present for content-addressed systems such as Mods.
+    pub source_digest: Option<String>,
     pub message: String,
+}
+
+impl SystemError {
+    pub fn new(
+        system: impl Into<String>,
+        tick: Tick,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            format_version: 1,
+            code: code.into(),
+            system: system.into(),
+            tick,
+            source_digest: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_source_digest(mut self, digest: impl Into<String>) -> Self {
+        self.source_digest = Some(digest.into());
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1356,10 +1387,12 @@ mod tests {
         }
 
         fn execute(&self, _world: &World, _tick: Tick) -> Result<Vec<Command>, SystemError> {
-            Err(SystemError {
-                system: self.id().to_owned(),
-                message: "fixture failure".to_owned(),
-            })
+            Err(SystemError::new(
+                self.id(),
+                _tick,
+                "kernel.test_failure",
+                "fixture failure",
+            ))
         }
     }
 

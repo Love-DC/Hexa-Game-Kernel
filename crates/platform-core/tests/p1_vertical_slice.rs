@@ -91,7 +91,22 @@ fn wasm_trap_rolls_back_external_commands_and_requires_reconstruction() {
         commands: vec![command],
     });
 
-    assert!(matches!(result, Err(KernelError::SystemFailed(_))));
+    let failure = match result {
+        Err(KernelError::SystemFailed(failure)) => failure,
+        other => panic!("expected stable Mod failure, got {other:?}"),
+    };
+    assert_eq!(failure.format_version, 1);
+    assert_eq!(failure.code, "platform.mod.execution_failed");
+    assert_eq!(failure.system, "org.game.fuel-loop");
+    assert_eq!(failure.tick, Tick(0));
+    assert_eq!(
+        failure.source_digest.as_deref(),
+        Some(package.content_digest.as_str())
+    );
+    let report = serde_json::to_value(&failure).unwrap();
+    assert_eq!(report["format_version"], 1);
+    assert_eq!(report["code"], "platform.mod.execution_failed");
+    assert_eq!(report["tick"], 0);
     assert_eq!(kernel.world().tick(), Tick(0));
     assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
     assert!(matches!(
