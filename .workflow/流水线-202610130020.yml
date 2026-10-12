@@ -1,25 +1,26 @@
-version: 1.0
-name: rust-ci
-displayName: Rust 持续集成
+version: '1.0'
+name: game-kernel-rust-ci
+displayName: Game Kernel Rust CI
+
 triggers:
+  trigger: auto
   push:
     branches:
-      include:
+      precise:
         - main
+
 stages:
-  - stage:
-      name: test
-      displayName: 格式检查与测试
-      steps:
-        - step: run
-          name: rust-build
-          displayName: 安装 Rust 环境并测试
-          script: |
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source $HOME/.cargo/env
-            echo "====== 检查代码格式 ======"
-            cargo fmt --check
-            echo "====== 运行 Clippy 静态检查 ======"
-            cargo clippy -- -D warnings
-            echo "====== 运行单元测试 ======"
-            cargo test
+  - name: rust-ci
+    displayName: Rust 检查
+    strategy: naturally
+    trigger: auto
+    steps:
+      - step: shell@agent
+        name: rust_checks
+        displayName: 格式检查、静态检查与测试
+        hostGroupID: gitee-go
+        script: |
+          rustc --version
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
