@@ -19,6 +19,12 @@ const MANIFEST_NAME: &str = "mod.json";
 const MANIFEST_VERSION: u32 = 1;
 const KERNEL_API_VERSION: &str = "0.1";
 const WASMTIME_RUNTIME_ID: &str = "wasmtime-48.0.5";
+/// Version of the in-memory [`LoadPlan`] encoding.
+const LOAD_PLAN_FORMAT_VERSION: u32 = 1;
+/// Version of the on-disk `mod-lock.json` document format.
+const LOCK_FILE_VERSION: u32 = 1;
+/// Domain separator for the canonical configuration digest.
+const CONFIG_DIGEST_DOMAIN: &[u8] = b"game-kernel-mod-lock-config-v1\0";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_MODULE_BYTES: u64 = 1024 * 1024;
 const MAX_LINEAR_MEMORY_BYTES: usize = 64 * 1024;
@@ -84,6 +90,22 @@ pub struct LockedMod {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LoadPlan {
     pub format_version: u32,
+    pub kernel_api: String,
+    pub runtime: String,
+    pub mods: Vec<LockedMod>,
+    pub config_digest: String,
+}
+
+/// On-disk `mod-lock.json` document: a versioned, reproducible record of a
+/// frozen [`LoadPlan`].
+///
+/// The file is a strict serialization of a load plan. Reading it re-verifies
+/// every recorded fact against the actual packages on disk (content digests and
+/// dependency declarations) instead of trusting the file's own contents.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockFile {
+    pub lock_version: u32,
     pub kernel_api: String,
     pub runtime: String,
     pub mods: Vec<LockedMod>,
@@ -187,6 +209,86 @@ impl std::fmt::Display for DependencyResolutionFailure {
     }
 }
 
+/// Stable classification for lock-file failures. Diagnostics are human-readable
+/// and may change; machines must match on these codes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum LockFileCode {
+    /// The lock file is not valid JSON or is missing required structure.
+    #[serde(rename = "platform.lock.invalid_format")]
+    InvalidFormat,
+    /// The lock file declares an unsupported `lock_version`.
+    #[serde(rename = "platform.lock.unknown_version")]
+    UnknownVersion,
+    /// `config_digest` recorded in the file does not match a recomputation.
+    #[serde(rename = "platform.lock.config_digest_mismatch")]
+    ConfigDigestMismatch,
+    /// A locked Mod is missing from, or not present in, the supplied packages.
+    #[serde(rename = "platform.lock.package_mismatch")]
+    PackageMismatch,
+    /// A locked Mod's recorded content digest does not match its package.
+    #[serde(rename = "platform.lock.content_digest_mismatch")]
+    ContentDigestMismatch,
+    /// A locked Mod's recorded dependency set does not match its manifest.
+    #[serde(rename = "platform.lock.dependency_mismatch")]
+    DependencyMismatch,
+    /// The locked Mod order differs from the resolver's canonical order.
+    #[serde(rename = "platform.lock.order_mismatch")]
+    OrderMismatch,
+}
+
+impl LockFileCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidFormat => "platform.lock.invalid_format",
+            Self::UnknownVersion => "platform.lock.unknown_version",
+            Self::ConfigDigestMismatch => "platform.lock.config_digest_mismatch",
+            Self::PackageMismatch => "platform.lock.package_mismatch",
+            Self::ContentDigestMismatch => "platform.lock.content_digest_mismatch",
+            Self::DependencyMismatch => "platform.lock.dependency_mismatch",
+            Self::OrderMismatch => "platform.lock.order_mismatch",
+        }
+    }
+}
+
+/// Structured lock-file failure carrying a stable code plus the Mod / field the
+/// failure refers to. `message` is diagnostic only and never a protocol field.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LockFileFailure {
+    pub code: LockFileCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub message: String,
+}
+
+impl LockFileFailure {
+    fn new(code: LockFileCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            mod_id: None,
+            detail: None,
+            message: message.into(),
+        }
+    }
+
+    fn with_mod(mut self, mod_id: impl Into<String>) -> Self {
+        self.mod_id = Some(mod_id.into());
+        self
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+impl std::fmt::Display for LockFileFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PlatformError {
     #[error("I/O error at `{path}`: {message}")]
@@ -209,6 +311,8 @@ pub enum PlatformError {
     Serialization(String),
     #[error("invalid embedded schema: {0}")]
     InvalidSchema(String),
+    #[error("lock file failure: {0}")]
+    LockFile(Box<LockFileFailure>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,6 +327,7 @@ pub enum PlatformErrorCode {
     WasmModule,
     Serialization,
     InvalidSchema,
+    LockFile,
 }
 
 impl PlatformErrorCode {
@@ -238,6 +343,7 @@ impl PlatformErrorCode {
             Self::WasmModule => "platform.wasm_module",
             Self::Serialization => "platform.serialization",
             Self::InvalidSchema => "platform.invalid_schema",
+            Self::LockFile => "platform.lock_file",
         }
     }
 }
@@ -248,6 +354,12 @@ impl PlatformError {
     /// variant, and `Result<_, PlatformError>` is returned on hot paths.
     fn dependency(failure: DependencyResolutionFailure) -> Self {
         Self::DependencyResolution(Box::new(failure))
+    }
+
+    /// Builds a lock-file failure with the same boxing rationale as
+    /// [`PlatformError::dependency`].
+    fn lock(failure: LockFileFailure) -> Self {
+        Self::LockFile(Box::new(failure))
     }
 
     pub const fn code(&self) -> PlatformErrorCode {
@@ -262,6 +374,7 @@ impl PlatformError {
             Self::WasmModule { .. } => PlatformErrorCode::WasmModule,
             Self::Serialization(_) => PlatformErrorCode::Serialization,
             Self::InvalidSchema(_) => PlatformErrorCode::InvalidSchema,
+            Self::LockFile(_) => PlatformErrorCode::LockFile,
         }
     }
 }
@@ -530,17 +643,328 @@ pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformEr
             }
         })
         .collect::<Vec<_>>();
-    let payload = serde_json::to_vec(&(1_u32, KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &mods))
-        .map_err(|error| PlatformError::Serialization(error.to_string()))?;
-    let config_digest = sha256_hex(&payload);
+    let config_digest = canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &mods)?;
 
     Ok(LoadPlan {
-        format_version: 1,
+        format_version: LOAD_PLAN_FORMAT_VERSION,
         kernel_api: KERNEL_API_VERSION.to_owned(),
         runtime: WASMTIME_RUNTIME_ID.to_owned(),
         mods,
         config_digest,
     })
+}
+
+/// Canonical configuration digest over the exact inputs that define a frozen
+/// load plan: the [`LOAD_PLAN_FORMAT_VERSION`], the Kernel API identifier, the
+/// runtime identifier, and the ordered Mod list (each Mod contributing its ID,
+/// version, content digest and sorted dependency IDs).
+///
+/// The input is a fixed, length-prefixed encoding so that a change to any of
+/// the Kernel API, the runtime, the ordered Mod combination, a Mod version, a
+/// Mod's content digest, or a Mod's dependency set produces a different digest.
+fn canonical_config_digest(
+    kernel_api: &str,
+    runtime: &str,
+    mods: &[LockedMod],
+) -> Result<String, PlatformError> {
+    let payload = serde_json::to_vec(&(LOAD_PLAN_FORMAT_VERSION, kernel_api, runtime, mods))
+        .map_err(|error| PlatformError::Serialization(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(CONFIG_DIGEST_DOMAIN);
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(&payload);
+    Ok(format!("sha256:{}", hex(&hasher.finalize())))
+}
+
+impl LoadPlan {
+    /// Converts the in-memory plan into its on-disk lock document. The mapping
+    /// is lossless for the fields the lock file records; the locked Mod order
+    /// and every recorded digest are preserved verbatim.
+    pub fn to_lock_file(&self) -> LockFile {
+        LockFile {
+            lock_version: LOCK_FILE_VERSION,
+            kernel_api: self.kernel_api.clone(),
+            runtime: self.runtime.clone(),
+            mods: self.mods.clone(),
+            config_digest: self.config_digest.clone(),
+        }
+    }
+
+    /// Recomputes the canonical configuration digest over this plan's current
+    /// `kernel_api`, `runtime` and ordered Mod list. Callers rebuilding a plan
+    /// from edited parts can use this to re-seal the digest.
+    pub fn recompute_config_digest(&self) -> Result<String, PlatformError> {
+        canonical_config_digest(&self.kernel_api, &self.runtime, &self.mods)
+    }
+}
+
+impl LockFile {
+    /// Serializes the lock document to canonical bytes: pretty-printed JSON
+    /// with a trailing newline. Deterministic for a given [`LoadPlan`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PlatformError> {
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| PlatformError::Serialization(error.to_string()))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    /// Parses a lock document from raw bytes.
+    ///
+    /// The document is validated against the embedded v1 schema and then parsed
+    /// strictly: unknown fields, malformed JSON and missing required fields are
+    /// all rejected. The Rust parser enforces the same structural rules
+    /// independently, so a failure to load the embedded schema cannot silently
+    /// disable validation. Version support is enforced separately by
+    /// [`LockFile::verify`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PlatformError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::InvalidFormat,
+                    "mod-lock.json is not valid JSON",
+                )
+                .with_detail(error.to_string()),
+            )
+        })?;
+        validate_lock_file_schema(&value)?;
+        serde_json::from_value(value).map_err(|error| {
+            PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::InvalidFormat,
+                    "mod-lock.json is not a valid, strictly-structured lock document",
+                )
+                .with_detail(error.to_string()),
+            )
+        })
+    }
+
+    /// Writes the lock document to `path` atomically.
+    ///
+    /// The bytes are first written to a sibling temporary file and then renamed
+    /// over the target, so an interrupted or failing write never truncates or
+    /// corrupts an existing lock file.
+    pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), PlatformError> {
+        let path = path.as_ref();
+        let bytes = self.to_bytes()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mod-lock.json");
+        let temp_name = format!(".{file_name}.tmp-{}", std::process::id());
+        let temp_path = match parent {
+            Some(parent) => parent.join(temp_name),
+            None => PathBuf::from(temp_name),
+        };
+        fs::write(&temp_path, &bytes).map_err(|error| io_error(&temp_path, error))?;
+        if let Err(error) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(io_error(path, error));
+        }
+        Ok(())
+    }
+
+    /// Reads and parses a lock document from `path`. The file is not modified.
+    pub fn read_from(path: impl AsRef<Path>) -> Result<Self, PlatformError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|error| io_error(path, error))?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Re-verifies the lock document against the packages it claims to lock and
+    /// returns the frozen [`LoadPlan`] on success.
+    ///
+    /// Verification recomputes every recorded fact rather than trusting the
+    /// file: the lock version, the canonical configuration digest, each Mod's
+    /// content digest, each Mod's dependency set, and the Mod order are all
+    /// checked against the actual packages and the resolver's canonical order.
+    pub fn verify(&self, packages: &[ModPackage]) -> Result<LoadPlan, PlatformError> {
+        if self.lock_version != LOCK_FILE_VERSION {
+            return Err(PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::UnknownVersion,
+                    format!(
+                        "unsupported lock_version {}; this Platform supports {LOCK_FILE_VERSION}",
+                        self.lock_version
+                    ),
+                )
+                .with_detail(self.lock_version.to_string()),
+            ));
+        }
+        if self.kernel_api != KERNEL_API_VERSION {
+            return Err(PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::ConfigDigestMismatch,
+                    format!(
+                        "lock file targets Kernel API `{}`, this Platform provides `{KERNEL_API_VERSION}`",
+                        self.kernel_api
+                    ),
+                )
+                .with_detail(self.kernel_api.clone()),
+            ));
+        }
+        if self.runtime != WASMTIME_RUNTIME_ID {
+            return Err(PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::ConfigDigestMismatch,
+                    format!(
+                        "lock file targets runtime `{}`, this Platform provides `{WASMTIME_RUNTIME_ID}`",
+                        self.runtime
+                    ),
+                )
+                .with_detail(self.runtime.clone()),
+            ));
+        }
+
+        // Index the actual packages so every recorded fact can be re-derived
+        // from source rather than trusted from the file.
+        let package_by_id = packages
+            .iter()
+            .map(|package| (package.manifest.id.as_str(), package))
+            .collect::<BTreeMap<_, _>>();
+
+        // 1. Each locked Mod must correspond to an actual package whose
+        //    version, content digest and dependency set all agree. A duplicate
+        //    Mod ID in the lock file is itself a structural violation.
+        let mut seen_ids = BTreeSet::new();
+        for locked in &self.mods {
+            if !seen_ids.insert(locked.id.as_str()) {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::PackageMismatch,
+                        format!("lock file lists Mod `{}` more than once", locked.id),
+                    )
+                    .with_mod(locked.id.as_str()),
+                ));
+            }
+            let Some(package) = package_by_id.get(locked.id.as_str()) else {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::PackageMismatch,
+                        format!("lock file references unknown Mod `{}`", locked.id),
+                    )
+                    .with_mod(locked.id.as_str()),
+                ));
+            };
+            if locked.version != package.manifest.version {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::PackageMismatch,
+                        format!(
+                            "locked version `{}` for Mod `{}` does not match package version `{}`",
+                            locked.version, locked.id, package.manifest.version
+                        ),
+                    )
+                    .with_mod(locked.id.as_str())
+                    .with_detail(locked.version.clone()),
+                ));
+            }
+            if locked.content_digest != package.content_digest {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::ContentDigestMismatch,
+                        format!(
+                            "locked content digest for Mod `{}` does not match the package",
+                            locked.id
+                        ),
+                    )
+                    .with_mod(locked.id.as_str())
+                    .with_detail(format!(
+                        "recorded={} package={}",
+                        locked.content_digest, package.content_digest
+                    )),
+                ));
+            }
+            // Compare the recorded dependency set against the package's real
+            // manifest, not against another derived structure.
+            let mut actual_dependencies = package
+                .manifest
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.id.clone())
+                .collect::<Vec<_>>();
+            actual_dependencies.sort();
+            if locked.dependencies != actual_dependencies {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::DependencyMismatch,
+                        format!(
+                            "locked dependency set for Mod `{}` does not match its manifest",
+                            locked.id
+                        ),
+                    )
+                    .with_mod(locked.id.as_str())
+                    .with_detail(format!(
+                        "recorded={:?} manifest={:?}",
+                        locked.dependencies, actual_dependencies
+                    )),
+                ));
+            }
+        }
+
+        // 2. Recompute the full plan from the packages so that membership,
+        //    canonical order and the configuration digest are all derived from
+        //    the resolver rather than the file.
+        let recomputed = resolve_load_plan(packages)?;
+
+        // 3. Every resolved Mod must be recorded in the file.
+        for locked in &recomputed.mods {
+            if !seen_ids.contains(locked.id.as_str()) {
+                return Err(PlatformError::lock(
+                    LockFileFailure::new(
+                        LockFileCode::PackageMismatch,
+                        format!("lock file is missing resolved Mod `{}`", locked.id),
+                    )
+                    .with_mod(locked.id.as_str()),
+                ));
+            }
+        }
+
+        // 4. The recorded order must equal the resolver's canonical order.
+        let recorded_order = self
+            .mods
+            .iter()
+            .map(|locked| &locked.id)
+            .collect::<Vec<_>>();
+        let expected_order = recomputed
+            .mods
+            .iter()
+            .map(|locked| &locked.id)
+            .collect::<Vec<_>>();
+        if recorded_order != expected_order {
+            return Err(PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::OrderMismatch,
+                    "locked Mod order does not match the resolver's canonical order",
+                )
+                .with_detail(format!(
+                    "recorded={recorded_order:?} expected={expected_order:?}"
+                )),
+            ));
+        }
+
+        // 5. Finally require the recorded configuration digest to match the
+        //    digest recomputed over the actual packages.
+        if self.config_digest != recomputed.config_digest {
+            return Err(PlatformError::lock(
+                LockFileFailure::new(
+                    LockFileCode::ConfigDigestMismatch,
+                    "recorded config_digest does not match the packages on disk",
+                )
+                .with_detail(format!(
+                    "recorded={} recomputed={}",
+                    self.config_digest, recomputed.config_digest
+                )),
+            ));
+        }
+
+        Ok(recomputed)
+    }
 }
 
 /// Returns a deterministic cycle path `a -> b -> ... -> a` inside the set of
@@ -886,6 +1310,32 @@ fn validate_manifest_schema(value: &serde_json::Value) -> Result<(), PlatformErr
     Ok(())
 }
 
+fn validate_lock_file_schema(value: &serde_json::Value) -> Result<(), PlatformError> {
+    static VALIDATOR: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/mod-lock-v1.schema.json"))
+                .map_err(|error| error.to_string())?;
+        jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+    });
+    let validator = validator
+        .as_ref()
+        .map_err(|error| PlatformError::InvalidSchema(error.clone()))?;
+    if let Err(error) = validator.validate(value) {
+        return Err(PlatformError::lock(
+            LockFileFailure::new(
+                LockFileCode::InvalidFormat,
+                "mod-lock.json violates the v1 lock schema",
+            )
+            .with_detail(format!(
+                "schema violation at `{}`: {error}",
+                error.instance_path()
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_entrypoint_path(value: &str) -> Result<(), String> {
     let path = Path::new(value);
     if value.is_empty()
@@ -944,10 +1394,6 @@ fn package_digest(manifest: &ModManifest, module_bytes: &[u8]) -> Result<String,
     hasher.update((module_bytes.len() as u64).to_le_bytes());
     hasher.update(module_bytes);
     Ok(format!("sha256:{}", hex(&hasher.finalize())))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("sha256:{}", hex(&Sha256::digest(bytes)))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1101,6 +1547,73 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.mods[0].id, package.manifest.id);
         assert_eq!(first.runtime, WASMTIME_RUNTIME_ID);
+    }
+
+    #[test]
+    fn lock_v1_schema_is_valid_and_matches_the_serialized_plan() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/mod-lock-v1.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(jsonschema::meta::validate(&schema).is_ok());
+
+        let package = ModPackage::load(sample_root()).unwrap();
+        let plan = resolve_load_plan(std::slice::from_ref(&package)).unwrap();
+        let lock_value = serde_json::to_value(plan.to_lock_file()).unwrap();
+        assert!(validator.validate(&lock_value).is_ok());
+
+        // The Rust parser must reject the same unknown-field case the schema
+        // rejects, independently of schema availability.
+        let mut unknown = lock_value.clone();
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert!(matches!(
+            LockFile::from_bytes(&serde_json::to_vec(&unknown).unwrap()),
+            Err(PlatformError::LockFile(_))
+        ));
+    }
+
+    #[test]
+    fn config_digest_changes_with_every_locked_input() {
+        let base = LockedMod {
+            id: "org.game.a".to_owned(),
+            version: "1.0.0".to_owned(),
+            content_digest: "sha256:aa".to_owned(),
+            dependencies: vec!["org.game.b".to_owned()],
+        };
+        let baseline = canonical_config_digest(
+            KERNEL_API_VERSION,
+            WASMTIME_RUNTIME_ID,
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
+
+        let mut changed_content = base.clone();
+        changed_content.content_digest = "sha256:bb".to_owned();
+        let mut changed_version = base.clone();
+        changed_version.version = "2.0.0".to_owned();
+        let mut changed_deps = base.clone();
+        changed_deps.dependencies = vec!["org.game.c".to_owned()];
+
+        let cases = [
+            canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &[changed_content])
+                .unwrap(),
+            canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &[changed_version])
+                .unwrap(),
+            canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &[changed_deps])
+                .unwrap(),
+            canonical_config_digest("9.9", WASMTIME_RUNTIME_ID, std::slice::from_ref(&base))
+                .unwrap(),
+            canonical_config_digest(KERNEL_API_VERSION, "runtime-x", std::slice::from_ref(&base))
+                .unwrap(),
+            canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &[]).unwrap(),
+        ];
+        for digest in cases {
+            assert_ne!(digest, baseline, "a changed input must change the digest");
+        }
+        // Recomputing the same input is stable.
+        assert_eq!(
+            canonical_config_digest(KERNEL_API_VERSION, WASMTIME_RUNTIME_ID, &[base]).unwrap(),
+            baseline
+        );
     }
 
     #[test]

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/mod-lock-v1.schema.json",
+  "title": "Game Kernel Mod Lock v1",
+  "description": "Structural schema for the on-disk mod-lock.json document. This schema checks shape only; Platform independently re-verifies the lock version, the canonical config digest, each Mod's content digest, dependency set and order against the actual packages.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lock_version",
+    "kernel_api",
+    "runtime",
+    "mods",
+    "config_digest"
+  ],
+  "properties": {
+    "lock_version": { "const": 1 },
+    "kernel_api": { "const": "0.1" },
+    "runtime": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "mods": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/locked_mod" }
+    },
+    "config_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "mod_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)*$"
+    },
+    "locked_mod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "content_digest", "dependencies"],
+      "properties": {
+        "id": { "$ref": "#/$defs/mod_id" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "content_digest": { "$ref": "#/$defs/digest" },
+        "dependencies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/mod_id" }
+        }
+      }
+    }
+  }
+}
