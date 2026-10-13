@@ -90,6 +90,103 @@ pub struct LoadPlan {
     pub config_digest: String,
 }
 
+/// Stable classification for dependency resolution failures. Diagnostics are
+/// human-readable and may change; machines must match on these codes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DependencyResolutionCode {
+    #[serde(rename = "platform.dependency.duplicate_mod_id")]
+    DuplicateModId,
+    #[serde(rename = "platform.dependency.duplicate_dependency")]
+    DuplicateDependency,
+    #[serde(rename = "platform.dependency.missing_dependency")]
+    MissingDependency,
+    #[serde(rename = "platform.dependency.invalid_version_requirement")]
+    InvalidVersionRequirement,
+    #[serde(rename = "platform.dependency.version_incompatible")]
+    VersionIncompatible,
+    #[serde(rename = "platform.dependency.cycle")]
+    DependencyCycle,
+}
+
+impl DependencyResolutionCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuplicateModId => "platform.dependency.duplicate_mod_id",
+            Self::DuplicateDependency => "platform.dependency.duplicate_dependency",
+            Self::MissingDependency => "platform.dependency.missing_dependency",
+            Self::InvalidVersionRequirement => "platform.dependency.invalid_version_requirement",
+            Self::VersionIncompatible => "platform.dependency.version_incompatible",
+            Self::DependencyCycle => "platform.dependency.cycle",
+        }
+    }
+}
+
+/// Structured dependency resolution failure. Carries a stable code plus the
+/// Mod/dependency identities the caller needs to act on; `message` is
+/// diagnostic text and is not part of the machine protocol.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DependencyResolutionFailure {
+    pub code: DependencyResolutionCode,
+    /// Declaring Mod for dependency failures, or the duplicated Mod ID.
+    pub mod_id: Option<String>,
+    /// Related dependency identity, when the failure involves one.
+    pub dependency_id: Option<String>,
+    /// Declared version requirement, when the failure involves one.
+    pub requirement: Option<String>,
+    /// Version found in the candidate package, when the failure involves one.
+    pub found_version: Option<String>,
+    /// Deterministic cycle path `a -> b -> ... -> a`; empty unless the code is
+    /// `DependencyCycle`.
+    pub cycle: Vec<String>,
+    /// Human-readable diagnostic. Not part of the machine protocol.
+    pub message: String,
+}
+
+impl DependencyResolutionFailure {
+    fn new(code: DependencyResolutionCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            mod_id: None,
+            dependency_id: None,
+            requirement: None,
+            found_version: None,
+            cycle: Vec::new(),
+            message: message.into(),
+        }
+    }
+
+    fn with_mod(mut self, mod_id: impl Into<String>) -> Self {
+        self.mod_id = Some(mod_id.into());
+        self
+    }
+
+    fn with_dependency(mut self, dependency_id: impl Into<String>) -> Self {
+        self.dependency_id = Some(dependency_id.into());
+        self
+    }
+
+    fn with_requirement(mut self, requirement: impl Into<String>) -> Self {
+        self.requirement = Some(requirement.into());
+        self
+    }
+
+    fn with_found_version(mut self, version: impl Into<String>) -> Self {
+        self.found_version = Some(version.into());
+        self
+    }
+
+    fn with_cycle(mut self, cycle: Vec<String>) -> Self {
+        self.cycle = cycle;
+        self
+    }
+}
+
+impl std::fmt::Display for DependencyResolutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PlatformError {
     #[error("I/O error at `{path}`: {message}")]
@@ -103,7 +200,7 @@ pub enum PlatformError {
     #[error("Mod `{mod_id}` imports an API requiring unrequested permission `{permission}`")]
     PermissionNotRequested { mod_id: String, permission: String },
     #[error("dependency resolution failed: {0}")]
-    DependencyResolution(String),
+    DependencyResolution(Box<DependencyResolutionFailure>),
     #[error("Wasm runtime setup failed: {0}")]
     RuntimeSetup(String),
     #[error("Wasm module for Mod `{mod_id}` is invalid: {message}")]
@@ -146,6 +243,13 @@ impl PlatformErrorCode {
 }
 
 impl PlatformError {
+    /// Builds a dependency resolution failure. The payload is boxed because the
+    /// structured failure is much larger than every other `PlatformError`
+    /// variant, and `Result<_, PlatformError>` is returned on hot paths.
+    fn dependency(failure: DependencyResolutionFailure) -> Self {
+        Self::DependencyResolution(Box::new(failure))
+    }
+
     pub const fn code(&self) -> PlatformErrorCode {
         match self {
             Self::Io { .. } => PlatformErrorCode::Io,
@@ -259,12 +363,21 @@ pub fn discover_mods(directory: impl AsRef<Path>) -> Result<Vec<ModPackage>, Pla
 pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformError> {
     let mut by_id = BTreeMap::<String, &ModPackage>::new();
     for package in packages {
-        if by_id.insert(package.manifest.id.clone(), package).is_some() {
-            return Err(PlatformError::DependencyResolution(format!(
-                "duplicate Mod ID `{}`",
-                package.manifest.id
-            )));
+        if by_id.contains_key(&package.manifest.id) {
+            return Err(PlatformError::dependency(
+                DependencyResolutionFailure::new(
+                    DependencyResolutionCode::DuplicateModId,
+                    format!(
+                        "Mod ID `{}` has more than one candidate package; the Platform does not \
+                     choose between candidates and requires the caller to select one",
+                        package.manifest.id
+                    ),
+                )
+                .with_mod(package.manifest.id.as_str())
+                .with_dependency(package.manifest.id.as_str()),
+            ));
         }
+        by_id.insert(package.manifest.id.clone(), package);
     }
 
     let mut incoming = by_id
@@ -289,31 +402,68 @@ pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformEr
         });
         for dependency in dependencies {
             if !seen_dependencies.insert(dependency.id.clone()) {
-                return Err(PlatformError::DependencyResolution(format!(
-                    "Mod `{id}` repeats dependency `{}`",
-                    dependency.id
-                )));
+                return Err(PlatformError::dependency(
+                    DependencyResolutionFailure::new(
+                        DependencyResolutionCode::DuplicateDependency,
+                        format!(
+                            "Mod `{id}` declares dependency `{}` more than once; the required \
+                         dependency set must be unambiguous",
+                            dependency.id
+                        ),
+                    )
+                    .with_mod(id.as_str())
+                    .with_dependency(dependency.id.as_str())
+                    .with_requirement(dependency.version.as_str()),
+                ));
             }
-            let provider = by_id.get(&dependency.id).ok_or_else(|| {
-                PlatformError::DependencyResolution(format!(
-                    "Mod `{id}` requires missing Mod `{}`",
-                    dependency.id
-                ))
-            })?;
+            let provider =
+                by_id.get(&dependency.id).ok_or_else(|| {
+                    PlatformError::dependency(DependencyResolutionFailure::new(
+                    DependencyResolutionCode::MissingDependency,
+                    format!(
+                        "Mod `{id}` requires missing required Mod `{}` {}; a missing required \
+                         dependency is never treated as optional",
+                        dependency.id, dependency.version
+                    ),
+                )
+                .with_mod(id.as_str())
+                .with_dependency(dependency.id.as_str())
+                .with_requirement(dependency.version.as_str()))
+                })?;
             let requirement = VersionReq::parse(&dependency.version).map_err(|error| {
-                PlatformError::DependencyResolution(format!(
-                    "Mod `{id}` has invalid version range `{}`: {error}",
-                    dependency.version
-                ))
+                PlatformError::dependency(
+                    DependencyResolutionFailure::new(
+                        DependencyResolutionCode::InvalidVersionRequirement,
+                        format!(
+                            "Mod `{id}` has invalid version range `{}`: {error}",
+                            dependency.version
+                        ),
+                    )
+                    .with_mod(id.as_str())
+                    .with_dependency(dependency.id.as_str())
+                    .with_requirement(dependency.version.as_str()),
+                )
             })?;
             let version = Version::parse(&provider.manifest.version).map_err(|error| {
-                PlatformError::InvalidManifest(format!("invalid Mod version: {error}"))
+                PlatformError::InvalidManifest(format!(
+                    "invalid Mod version for `{}`: {error}",
+                    dependency.id
+                ))
             })?;
             if !requirement.matches(&version) {
-                return Err(PlatformError::DependencyResolution(format!(
-                    "Mod `{id}` requires `{}` {}, found {}",
-                    dependency.id, dependency.version, provider.manifest.version
-                )));
+                return Err(PlatformError::dependency(
+                    DependencyResolutionFailure::new(
+                        DependencyResolutionCode::VersionIncompatible,
+                        format!(
+                            "Mod `{id}` requires `{}` {}, found {}",
+                            dependency.id, dependency.version, provider.manifest.version
+                        ),
+                    )
+                    .with_mod(id.as_str())
+                    .with_dependency(dependency.id.as_str())
+                    .with_requirement(dependency.version.as_str())
+                    .with_found_version(provider.manifest.version.as_str()),
+                ));
             }
             *incoming.get_mut(id).expect("all package IDs have indegree") += 1;
             dependents
@@ -342,14 +492,23 @@ pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformEr
         }
     }
     if ordered_ids.len() != packages.len() {
-        let cycle = incoming
-            .into_iter()
-            .filter_map(|(id, count)| (count > 0).then_some(id))
-            .collect::<Vec<_>>();
-        return Err(PlatformError::DependencyResolution(format!(
-            "dependency cycle involves: {}",
-            cycle.join(" -> ")
-        )));
+        let unresolved = incoming
+            .iter()
+            .filter_map(|(id, count)| (*count > 0).then_some(id.clone()))
+            .collect::<BTreeSet<_>>();
+        let cycle = find_dependency_cycle(&by_id, &unresolved);
+        let mut failure = DependencyResolutionFailure::new(
+            DependencyResolutionCode::DependencyCycle,
+            format!(
+                "required dependency graph must be acyclic; cycle path: {}",
+                cycle.join(" -> ")
+            ),
+        )
+        .with_cycle(cycle.clone());
+        if let Some(first) = cycle.first() {
+            failure = failure.with_mod(first.clone());
+        }
+        return Err(PlatformError::dependency(failure));
     }
 
     let mods = ordered_ids
@@ -382,6 +541,47 @@ pub fn resolve_load_plan(packages: &[ModPackage]) -> Result<LoadPlan, PlatformEr
         mods,
         config_digest,
     })
+}
+
+/// Returns a deterministic cycle path `a -> b -> ... -> a` inside the set of
+/// Mod IDs that Kahn's algorithm could not order.
+///
+/// Every unresolved Mod still has at least one unresolved required dependency,
+/// so repeatedly following the lowest-sorted unresolved dependency must
+/// terminate at an already-visited Mod. The result therefore depends only on
+/// the package contents, not on the candidate input order.
+fn find_dependency_cycle(
+    by_id: &BTreeMap<String, &ModPackage>,
+    unresolved: &BTreeSet<String>,
+) -> Vec<String> {
+    let Some(start) = unresolved.first().cloned() else {
+        return Vec::new();
+    };
+    let mut path = vec![start.clone()];
+    let mut current = start;
+    loop {
+        let next = by_id.get(&current).and_then(|package| {
+            package
+                .manifest
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.id.clone())
+                .filter(|id| unresolved.contains(id))
+                .min()
+        });
+        let Some(next) = next else {
+            // Defensive: an unresolved Mod always keeps an unresolved
+            // dependency, so a reachable cycle exists for every real input.
+            return path;
+        };
+        if let Some(position) = path.iter().position(|id| *id == next) {
+            let mut cycle = path.split_off(position);
+            cycle.push(next);
+            return cycle;
+        }
+        path.push(next.clone());
+        current = next;
+    }
 }
 
 pub fn create_wasm_engine() -> Result<Engine, PlatformError> {
@@ -910,11 +1110,288 @@ mod tests {
             id: "org.game.missing".to_owned(),
             version: "^1.0.0".to_owned(),
         });
-        let result = resolve_load_plan(&[package]);
-        assert!(matches!(
-            result,
-            Err(PlatformError::DependencyResolution(_))
-        ));
+        let failure = dependency_failure(resolve_load_plan(&[package]));
+        assert_eq!(failure.code, DependencyResolutionCode::MissingDependency);
+        assert_eq!(
+            failure.code.as_str(),
+            "platform.dependency.missing_dependency"
+        );
+        assert_eq!(failure.mod_id.as_deref(), Some("org.game.p1-counter"));
+        assert_eq!(failure.dependency_id.as_deref(), Some("org.game.missing"));
+        assert_eq!(failure.requirement.as_deref(), Some("^1.0.0"));
+    }
+
+    /// Synthetic packages keep the resolver tests focused on the public
+    /// `resolve_load_plan` contract without needing a directory on disk.
+    fn synthetic_package(id: &str, version: &str, dependencies: &[(&str, &str)]) -> ModPackage {
+        ModPackage {
+            root: PathBuf::from(format!("synthetic/{id}")),
+            manifest: ModManifest {
+                manifest_version: MANIFEST_VERSION,
+                id: id.to_owned(),
+                version: version.to_owned(),
+                kernel_api: KERNEL_API_VERSION.to_owned(),
+                entrypoint: "module.wat".to_owned(),
+                requested_permissions: BTreeSet::new(),
+                dependencies: dependencies
+                    .iter()
+                    .map(|(id, version)| ModDependency {
+                        id: (*id).to_owned(),
+                        version: (*version).to_owned(),
+                    })
+                    .collect(),
+            },
+            module_bytes: Vec::new(),
+            content_digest: format!("sha256:synthetic-{id}-{version}"),
+        }
+    }
+
+    fn dependency_failure(result: Result<LoadPlan, PlatformError>) -> DependencyResolutionFailure {
+        match result {
+            Err(PlatformError::DependencyResolution(failure)) => *failure,
+            other => panic!("expected a dependency resolution failure, got {other:?}"),
+        }
+    }
+
+    /// Every ordering of the candidate slice, so that "all optional input
+    /// permutations produce the same plan" is actually exercised.
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut result = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let mut rest = items.to_vec();
+            rest.remove(index);
+            for tail in permutations(&rest) {
+                let mut permutation = vec![item.clone()];
+                permutation.extend(tail);
+                result.push(permutation);
+            }
+        }
+        result
+    }
+
+    fn diamond_graph() -> Vec<ModPackage> {
+        vec![
+            synthetic_package("org.game.core", "0.1.0", &[]),
+            synthetic_package("org.game.lib-a", "0.2.0", &[("org.game.core", "^0.1.0")]),
+            synthetic_package("org.game.lib-b", "0.2.0", &[("org.game.core", "^0.1.0")]),
+            synthetic_package(
+                "org.game.app",
+                "1.0.0",
+                // Deliberately unsorted so the resolver must canonicalize.
+                &[("org.game.lib-b", "^0.2.0"), ("org.game.lib-a", "^0.2.0")],
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_candidate_order_produces_the_same_load_plan() {
+        let packages = diamond_graph();
+        let expected = resolve_load_plan(&packages).unwrap();
+        assert_eq!(
+            expected
+                .mods
+                .iter()
+                .map(|locked| locked.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "org.game.core",
+                "org.game.lib-a",
+                "org.game.lib-b",
+                "org.game.app"
+            ]
+        );
+        let app = expected
+            .mods
+            .iter()
+            .find(|locked| locked.id == "org.game.app")
+            .unwrap();
+        assert_eq!(
+            app.dependencies,
+            ["org.game.lib-a", "org.game.lib-b"],
+            "locked dependency lists must be canonical, not manifest order"
+        );
+
+        let orderings = permutations(&packages);
+        assert_eq!(orderings.len(), 24);
+        for ordering in orderings {
+            assert_eq!(resolve_load_plan(&ordering).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn repeated_resolution_is_stable() {
+        let packages = diamond_graph();
+        let first = resolve_load_plan(&packages).unwrap();
+        for _ in 0..5 {
+            assert_eq!(resolve_load_plan(&packages).unwrap(), first);
+        }
+        assert!(first.config_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn duplicate_mod_ids_are_rejected_instead_of_silently_chosen() {
+        let first = synthetic_package("org.game.dup", "1.0.0", &[]);
+        let second = synthetic_package("org.game.dup", "1.0.1", &[]);
+        let failure = dependency_failure(resolve_load_plan(&[first.clone(), second.clone()]));
+        assert_eq!(failure.code, DependencyResolutionCode::DuplicateModId);
+        assert_eq!(
+            failure.code.as_str(),
+            "platform.dependency.duplicate_mod_id"
+        );
+        assert_eq!(failure.mod_id.as_deref(), Some("org.game.dup"));
+        assert!(failure.message.contains("does not"));
+
+        // Candidate order must not change which diagnostic is reported.
+        assert_eq!(
+            dependency_failure(resolve_load_plan(&[second, first])),
+            failure
+        );
+    }
+
+    #[test]
+    fn duplicate_dependency_declarations_are_rejected() {
+        let packages = vec![
+            synthetic_package("org.game.core", "0.1.0", &[]),
+            synthetic_package(
+                "org.game.app",
+                "1.0.0",
+                &[("org.game.core", "^0.1.0"), ("org.game.core", "^0.1.0")],
+            ),
+        ];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        assert_eq!(failure.code, DependencyResolutionCode::DuplicateDependency);
+        assert_eq!(
+            failure.code.as_str(),
+            "platform.dependency.duplicate_dependency"
+        );
+        assert_eq!(failure.mod_id.as_deref(), Some("org.game.app"));
+        assert_eq!(failure.dependency_id.as_deref(), Some("org.game.core"));
+    }
+
+    #[test]
+    fn version_mismatch_reports_the_requirement_and_the_found_version() {
+        let packages = vec![
+            synthetic_package("org.game.core", "1.0.0", &[]),
+            synthetic_package("org.game.app", "1.0.0", &[("org.game.core", "^2.0.0")]),
+        ];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        assert_eq!(failure.code, DependencyResolutionCode::VersionIncompatible);
+        assert_eq!(
+            failure.code.as_str(),
+            "platform.dependency.version_incompatible"
+        );
+        assert_eq!(failure.mod_id.as_deref(), Some("org.game.app"));
+        assert_eq!(failure.dependency_id.as_deref(), Some("org.game.core"));
+        assert_eq!(failure.requirement.as_deref(), Some("^2.0.0"));
+        assert_eq!(failure.found_version.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn invalid_version_requirement_is_a_structured_resolver_failure() {
+        let packages = vec![
+            synthetic_package("org.game.core", "1.0.0", &[]),
+            synthetic_package("org.game.app", "1.0.0", &[("org.game.core", "not a range")]),
+        ];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        assert_eq!(
+            failure.code,
+            DependencyResolutionCode::InvalidVersionRequirement
+        );
+        assert_eq!(failure.requirement.as_deref(), Some("not a range"));
+    }
+
+    #[test]
+    fn self_dependency_is_reported_as_a_cycle() {
+        let packages = vec![synthetic_package(
+            "org.game.loop",
+            "1.0.0",
+            &[("org.game.loop", "^1.0.0")],
+        )];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        assert_eq!(failure.code, DependencyResolutionCode::DependencyCycle);
+        assert_eq!(failure.cycle, ["org.game.loop", "org.game.loop"]);
+        assert_eq!(failure.mod_id.as_deref(), Some("org.game.loop"));
+    }
+
+    #[test]
+    fn multi_node_cycle_reports_a_stable_full_path_for_every_input_order() {
+        let packages = vec![
+            synthetic_package("org.game.a", "1.0.0", &[("org.game.b", "^1.0.0")]),
+            synthetic_package("org.game.b", "1.0.0", &[("org.game.c", "^1.0.0")]),
+            synthetic_package("org.game.c", "1.0.0", &[("org.game.a", "^1.0.0")]),
+        ];
+        let expected = ["org.game.a", "org.game.b", "org.game.c", "org.game.a"];
+        let orderings = permutations(&packages);
+        assert_eq!(orderings.len(), 6);
+        for ordering in orderings {
+            let failure = dependency_failure(resolve_load_plan(&ordering));
+            assert_eq!(failure.code, DependencyResolutionCode::DependencyCycle);
+            assert_eq!(failure.code.as_str(), "platform.dependency.cycle");
+            assert_eq!(failure.cycle, expected);
+            assert!(failure.message.contains("org.game.a -> org.game.b"));
+        }
+    }
+
+    #[test]
+    fn cyclic_subgraph_does_not_hide_an_otherwise_orderable_graph() {
+        let packages = vec![
+            synthetic_package("org.game.ok", "1.0.0", &[]),
+            synthetic_package("org.game.x", "1.0.0", &[("org.game.y", "^1.0.0")]),
+            synthetic_package("org.game.y", "1.0.0", &[("org.game.x", "^1.0.0")]),
+        ];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        assert_eq!(failure.code, DependencyResolutionCode::DependencyCycle);
+        assert_eq!(failure.cycle, ["org.game.x", "org.game.y", "org.game.x"]);
+        assert!(!failure.cycle.iter().any(|id| id == "org.game.ok"));
+    }
+
+    #[test]
+    fn missing_and_version_failures_are_reported_without_guessing_dependency_order() {
+        // `org.game.app` has two broken required dependencies. The selected
+        // diagnostic must be stable regardless of manifest array order.
+        let forward = vec![
+            synthetic_package("org.game.core", "1.0.0", &[]),
+            synthetic_package(
+                "org.game.app",
+                "1.0.0",
+                &[("org.game.absent", "^1.0.0"), ("org.game.core", "^2.0.0")],
+            ),
+        ];
+        let mut reversed_manifest = forward.clone();
+        reversed_manifest[1].manifest.dependencies.reverse();
+        let expected = dependency_failure(resolve_load_plan(&forward));
+        assert_eq!(
+            dependency_failure(resolve_load_plan(&reversed_manifest)),
+            expected
+        );
+        // "org.game.absent" sorts before "org.game.core", so it is reported first.
+        assert_eq!(expected.code, DependencyResolutionCode::MissingDependency);
+        assert_eq!(expected.dependency_id.as_deref(), Some("org.game.absent"));
+    }
+
+    #[test]
+    fn resolver_failure_serializes_with_stable_protocol_fields() {
+        let packages = vec![
+            synthetic_package("org.game.core", "1.0.0", &[]),
+            synthetic_package("org.game.app", "1.0.0", &[("org.game.core", "^2.0.0")]),
+        ];
+        let failure = dependency_failure(resolve_load_plan(&packages));
+        let report = serde_json::to_value(&failure).unwrap();
+        assert_eq!(report["code"], "platform.dependency.version_incompatible");
+        assert_eq!(report["mod_id"], "org.game.app");
+        assert_eq!(report["dependency_id"], "org.game.core");
+        assert_eq!(report["requirement"], "^2.0.0");
+        assert_eq!(report["found_version"], "1.0.0");
+        assert_eq!(report["cycle"], serde_json::json!([]));
+        assert_eq!(
+            PlatformError::DependencyResolution(Box::new(failure))
+                .code()
+                .as_str(),
+            "platform.dependency_resolution"
+        );
     }
 
     #[test]

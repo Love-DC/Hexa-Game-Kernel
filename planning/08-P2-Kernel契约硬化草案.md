@@ -71,11 +71,14 @@ Kernel crate 是以下权威类型的唯一所有者；Platform 只实现 `Syste
 | `KernelError`、`KernelErrorCode` | Kernel | 每个 Kernel 顶层失败有稳定 `kernel.*` 码；人类诊断文本可变。 |
 | `ModManifest`、`ModDependency`、`ModPackage` | Platform | 包声明、依赖与验证后的内容；包外路径拒绝；运行权限不能由 Mod 自己授予。 |
 | `LockedMod`、`LoadPlan` | Platform | 锁定内容摘要、依赖、Kernel API、运行时和配置摘要；相同输入生成相同计划。 |
-| `PlatformError`、`PlatformErrorCode` | Platform | 加载、校验、权限、解析和运行时初始化错误；错误码稳定、消息可变。 |
+| `PlatformError`、`PlatformErrorCode` | Platform | 加载、校验、权限、解析和运行时初始化错误；顶层错误码稳定、消息可变。 |
+| `DependencyResolutionFailure`、`DependencyResolutionCode` | Platform | 依赖解析失败的稳定子码与关联标识：`mod_id`/`dependency_id`/`requirement`/`found_version`/确定性 `cycle` 路径；`message` 仅供诊断。`PlatformError::DependencyResolution` 的载荷为 `Box<DependencyResolutionFailure>`（该变体远大于其他错误变体）。 |
 | `LoadedWasmMod`、`WasmSystem` | Platform | 受限 Wasm 适配器；只允许 manifest 声明且宿主授权的 allow-list API；不暴露 World 引用给 guest。 |
 | `ModFailureCode` | Platform | Runtime setup、执行失败、无效输出、无效 World 状态的稳定 `platform.mod.*` 分类。 |
 
 兼容规则：序列化的 Snapshot envelope v2 与 `SystemError` 报告 v1 对未知字段严格拒绝；改变字段含义、编码或删除字段必须提升对应格式版本。新增 Rust 公共字段属于源码兼容性变化，应同步更新此表、构造器、示例和集成测试。
+
+GK-P3-02 变更记录：`PlatformError::DependencyResolution` 由诊断字符串改为结构化载荷，顶层 `platform.dependency_resolution` 码保持不变；载荷实际类型为 `Box<DependencyResolutionFailure>`，构造使用 `PlatformError::dependency`，解包需解引用。该变更由 `planning/09-P3-Mod平台基线任务卡.md` 的 GK-P3-02 验收条件（"错误含稳定 PlatformErrorCode 与关联 Mod/依赖标识"）授权，未扩大权限面或运行时能力。
 
 ## 3. P2 工作分解与验收
 

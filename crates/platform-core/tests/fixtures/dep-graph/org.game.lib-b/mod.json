@@ -1,0 +1,9 @@
+{
+  "manifest_version": 1,
+  "id": "org.game.lib-b",
+  "version": "0.2.0",
+  "kernel_api": "0.1",
+  "entrypoint": "module.wat",
+  "requested_permissions": [],
+  "dependencies": [{ "id": "org.game.core", "version": "^0.1.0" }]
+}
