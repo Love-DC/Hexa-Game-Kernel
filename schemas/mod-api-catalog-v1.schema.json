@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/mod-api-catalog-v1.schema.json",
+  "title": "Game Kernel Mod API Catalog v1",
+  "description": "Structural schema for the exported host API catalog. This schema checks shape only; the Platform builds the catalog from its single in-code registry, so the schema, the Wasm Linker registrations and the permission allow-set cannot diverge.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["catalog_version", "kernel_api", "runtime", "apis"],
+  "properties": {
+    "catalog_version": { "const": 1 },
+    "kernel_api": { "const": "0.1" },
+    "runtime": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "apis": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/api_entry" }
+    }
+  },
+  "$defs": {
+    "api_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 200,
+      "pattern": "^[a-z0-9-]+::[a-z0-9_]+$"
+    },
+    "value_kind": {
+      "enum": ["i32", "i64", "f32", "f64", "v128"]
+    },
+    "api_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provider",
+        "api_version",
+        "summary",
+        "params",
+        "results",
+        "permission",
+        "phase",
+        "determinism",
+        "failure"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/api_id" },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "api_version": { "type": "integer", "minimum": 1 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "params": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/value_kind" }
+        },
+        "results": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/value_kind" }
+        },
+        "permission": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "phase": { "enum": ["world-read", "command-submit"] },
+        "determinism": { "enum": ["deterministic"] },
+        "failure": { "enum": ["write-rejected"] }
+      }
+    }
+  }
+}

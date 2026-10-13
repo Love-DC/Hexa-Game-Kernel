@@ -15,6 +15,10 @@ use wasmtime::{
     Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, WasmFeatures,
 };
 
+/// Re-export of the Wasmtime engine type so external consumers and contract
+/// tests can name it without depending on the Wasmtime crate directly.
+pub use wasmtime::Engine as WasmEngine;
+
 const MANIFEST_NAME: &str = "mod.json";
 const MANIFEST_VERSION: u32 = 1;
 const KERNEL_API_VERSION: &str = "0.1";
@@ -31,6 +35,441 @@ const MAX_LINEAR_MEMORY_BYTES: usize = 64 * 1024;
 const FUEL_PER_TICK: u64 = 10_000;
 const MAX_WASM_STACK_BYTES: usize = 256 * 1024;
 const COUNTER_RESOURCE: &str = "org.game/counter";
+
+/// Version of the exported API catalog document format.
+const API_CATALOG_VERSION: u32 = 1;
+/// Provider identity recorded for every host-builtin API.
+const HOST_API_PROVIDER: &str = "game-platform";
+/// Default API version understood by this build. Every registered host API
+/// declares this version; the registry rejects any requested version that is
+/// not exactly supported rather than exporting `api_version` unverified.
+const HOST_API_VERSION: u32 = 1;
+
+/// Direction of a single guest/host function parameter or result.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WasmValueKind {
+    I32,
+    I64,
+    F32,
+    F64,
+    V128,
+}
+
+impl WasmValueKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::V128 => "v128",
+        }
+    }
+}
+
+/// Explicit guest signature: ordered parameter kinds and result kinds.
+///
+/// The current host API subset exposes at most one parameter and at most one
+/// result, matching the `func_wrap` closures it must agree with.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostApiSignature {
+    pub params: HostApiValueList,
+    pub results: HostApiValueList,
+}
+
+/// Fixed-capacity list of value kinds (0 or 1 entries for the current subset).
+///
+/// A fixed shape keeps serialization deterministic and lets the catalog schema
+/// constrain the exact number of entries without free-form arrays.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostApiValueList {
+    pub len: u8,
+    pub kinds: [Option<WasmValueKind>; 1],
+}
+
+impl HostApiValueList {
+    pub const fn none() -> Self {
+        Self {
+            len: 0,
+            kinds: [None],
+        }
+    }
+
+    pub const fn one(kind: WasmValueKind) -> Self {
+        Self {
+            len: 1,
+            kinds: [Some(kind)],
+        }
+    }
+
+    /// Iterates the declared kinds in order.
+    pub fn iter(&self) -> impl Iterator<Item = WasmValueKind> + '_ {
+        self.kinds.iter().take(self.len as usize).filter_map(|k| *k)
+    }
+
+    /// Compares against an actual Wasmtime value-kind sequence.
+    fn matches_actual(&self, actual: &[WasmValueKind]) -> bool {
+        let declared = self.iter().collect::<Vec<_>>();
+        declared == actual
+    }
+}
+
+/// When during the Mod lifecycle an API may be called.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostApiPhase {
+    /// Read-only query of allowed world state.
+    WorldRead,
+    /// Submission of a world-modifying command request.
+    CommandSubmit,
+}
+
+impl HostApiPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorldRead => "world-read",
+            Self::CommandSubmit => "command-submit",
+        }
+    }
+}
+
+/// Determinism classification of an API call.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostApiDeterminism {
+    /// Result depends only on the authoritative world state and inputs.
+    Deterministic,
+}
+
+impl HostApiDeterminism {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deterministic => "deterministic",
+        }
+    }
+}
+
+/// Stable failure classification for an API call.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostApiFailureClass {
+    /// A write was rejected in the current Tick because one already happened.
+    WriteRejected,
+}
+
+impl HostApiFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WriteRejected => "write-rejected",
+        }
+    }
+}
+
+/// Machine-readable descriptor for one host-builtin API. This is the single
+/// source of truth that the module-import validation, the permission allow-set,
+/// the Wasm `Linker` registration and the exported catalog all derive from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostApiDescriptor {
+    /// Stable API ID, `"<module>::<field>"`.
+    pub id: &'static str,
+    /// Wasm import module name.
+    pub module: &'static str,
+    /// Wasm import field name.
+    pub field: &'static str,
+    /// API version understood by this build.
+    pub api_version: u32,
+    /// Mod ID of the provider.
+    pub provider: &'static str,
+    /// Guest-facing signature.
+    pub signature: HostApiSignature,
+    /// Permission required to call this API.
+    pub permission: &'static str,
+    /// Lifecycle phase in which the API may be called.
+    pub phase: HostApiPhase,
+    /// Determinism classification.
+    pub determinism: HostApiDeterminism,
+    /// Failure classification.
+    pub failure: HostApiFailureClass,
+    /// Short human-readable summary.
+    pub summary: &'static str,
+}
+
+/// The complete set of host APIs implemented by this build, in a fixed
+/// declaration order that is also the catalog's canonical order.
+///
+/// Adding an API means adding a descriptor here and a matching `func_wrap`
+/// registration; the contract tests enumerate the real `Linker` entries and
+/// fail if the two ever diverge.
+const HOST_APIS: &[HostApiDescriptor] = &[
+    HostApiDescriptor {
+        id: "gk::counter_read",
+        module: "gk",
+        field: "counter_read",
+        api_version: HOST_API_VERSION,
+        provider: HOST_API_PROVIDER,
+        signature: HostApiSignature {
+            params: HostApiValueList::none(),
+            results: HostApiValueList::one(WasmValueKind::I64),
+        },
+        permission: "world.read",
+        phase: HostApiPhase::WorldRead,
+        determinism: HostApiDeterminism::Deterministic,
+        failure: HostApiFailureClass::WriteRejected,
+        summary: "Read the current authoritative counter value for this Tick",
+    },
+    HostApiDescriptor {
+        id: "gk::counter_set",
+        module: "gk",
+        field: "counter_set",
+        api_version: HOST_API_VERSION,
+        provider: HOST_API_PROVIDER,
+        signature: HostApiSignature {
+            params: HostApiValueList::one(WasmValueKind::I64),
+            results: HostApiValueList::none(),
+        },
+        permission: "world.command",
+        phase: HostApiPhase::CommandSubmit,
+        determinism: HostApiDeterminism::Deterministic,
+        failure: HostApiFailureClass::WriteRejected,
+        summary: "Request a counter write; at most one write is accepted per Tick",
+    },
+];
+
+/// Looks up a registered host API by its Wasm import module and field names.
+fn find_host_api(module: &str, field: &str) -> Option<&'static HostApiDescriptor> {
+    HOST_APIS
+        .iter()
+        .find(|api| api.module == module && api.field == field)
+}
+
+/// The set of permissions any registered host API requires, in the catalog's
+/// declaration order and de-duplicated. Manifest permission validation derives
+/// from this rather than a hand-written list.
+fn all_host_api_permissions() -> BTreeSet<&'static str> {
+    HOST_APIS.iter().map(|api| api.permission).collect()
+}
+
+/// Internal consistency check over the registry source itself: no duplicate IDs,
+/// every declared API version is the one this build supports, and the import
+/// coordinates are unique. Exposed for contract tests; a regression here fails
+/// the build rather than silently exporting a wrong catalog.
+pub fn validate_registry() -> Result<(), PlatformError> {
+    let mut ids = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+    for api in HOST_APIS {
+        if !ids.insert(api.id) {
+            return Err(PlatformError::api_catalog(
+                ApiCatalogFailure::new(
+                    ApiCatalogCode::DuplicateApiId,
+                    format!("registry lists API `{}` more than once", api.id),
+                )
+                .with_detail(api.id.to_owned()),
+            ));
+        }
+        if !imports.insert((api.module, api.field)) {
+            return Err(PlatformError::api_catalog(
+                ApiCatalogFailure::new(
+                    ApiCatalogCode::DuplicateApiId,
+                    format!(
+                        "registry maps import `{}::{}` more than once",
+                        api.module, api.field
+                    ),
+                )
+                .with_detail(api.id.to_owned()),
+            ));
+        }
+        if api.api_version != HOST_API_VERSION {
+            return Err(PlatformError::api_catalog(
+                ApiCatalogFailure::new(
+                    ApiCatalogCode::UnsupportedApiVersion,
+                    format!(
+                        "API `{}` declares version {}; this build supports {HOST_API_VERSION}",
+                        api.id, api.api_version
+                    ),
+                )
+                .with_detail(api.id.to_owned()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stable classification for API catalog failures.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ApiCatalogCode {
+    #[serde(rename = "platform.api_catalog.unknown_version")]
+    UnknownVersion,
+    #[serde(rename = "platform.api_catalog.unsupported_api_version")]
+    UnsupportedApiVersion,
+    #[serde(rename = "platform.api_catalog.duplicate_api_id")]
+    DuplicateApiId,
+}
+
+impl ApiCatalogCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownVersion => "platform.api_catalog.unknown_version",
+            Self::UnsupportedApiVersion => "platform.api_catalog.unsupported_api_version",
+            Self::DuplicateApiId => "platform.api_catalog.duplicate_api_id",
+        }
+    }
+}
+
+/// Structured API catalog failure. Diagnostics are human-readable; machines
+/// must match on the stable code.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApiCatalogFailure {
+    pub code: ApiCatalogCode,
+    /// Offending API ID or catalog version, when the failure involves one.
+    pub detail: Option<String>,
+    pub message: String,
+}
+
+impl ApiCatalogFailure {
+    fn new(code: ApiCatalogCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: None,
+            message: message.into(),
+        }
+    }
+
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Stable machine-readable code.
+    pub const fn code(&self) -> ApiCatalogCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for ApiCatalogFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Serializable entry of the exported API catalog.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiCatalogEntry {
+    pub id: String,
+    pub provider: String,
+    pub api_version: u32,
+    pub summary: String,
+    pub params: Vec<WasmValueKind>,
+    pub results: Vec<WasmValueKind>,
+    pub permission: String,
+    pub phase: HostApiPhase,
+    pub determinism: HostApiDeterminism,
+    pub failure: HostApiFailureClass,
+}
+
+/// Machine-readable catalog of every host API implemented by this build
+/// (`Mod Platform Specification` §8.4).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiCatalog {
+    pub catalog_version: u32,
+    pub kernel_api: String,
+    pub runtime: String,
+    pub apis: Vec<ApiCatalogEntry>,
+}
+
+impl ApiCatalog {
+    /// Builds the catalog from the registry. Entries are sorted by API ID so
+    /// the output is stable regardless of declaration order.
+    pub fn from_registry() -> Self {
+        let mut apis = HOST_APIS
+            .iter()
+            .map(|api| ApiCatalogEntry {
+                id: api.id.to_owned(),
+                provider: api.provider.to_owned(),
+                api_version: api.api_version,
+                summary: api.summary.to_owned(),
+                params: api.signature.params.iter().collect(),
+                results: api.signature.results.iter().collect(),
+                permission: api.permission.to_owned(),
+                phase: api.phase,
+                determinism: api.determinism,
+                failure: api.failure,
+            })
+            .collect::<Vec<_>>();
+        apis.sort_by(|left, right| left.id.cmp(&right.id));
+        Self {
+            catalog_version: API_CATALOG_VERSION,
+            kernel_api: KERNEL_API_VERSION.to_owned(),
+            runtime: WASMTIME_RUNTIME_ID.to_owned(),
+            apis,
+        }
+    }
+
+    /// Serializes the catalog to canonical bytes: pretty JSON with a trailing
+    /// newline. Deterministic for a given registry.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PlatformError> {
+        let mut bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| PlatformError::Serialization(error.to_string()))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    /// Verifies the catalog's own version and every entry's declared API version
+    /// against the versions this build supports.
+    ///
+    /// This is the acceptance point for "a version that is not supported must be
+    /// rejected": the exported `api_version` is a claim, and a claim the build
+    /// cannot honour must fail here rather than be exported unverified. Duplicate
+    /// API IDs are rejected as well.
+    pub fn verify(&self) -> Result<(), PlatformError> {
+        if self.catalog_version != API_CATALOG_VERSION {
+            return Err(PlatformError::api_catalog(
+                ApiCatalogFailure::new(
+                    ApiCatalogCode::UnknownVersion,
+                    format!(
+                        "unsupported catalog_version {}; this build supports {API_CATALOG_VERSION}",
+                        self.catalog_version
+                    ),
+                )
+                .with_detail(self.catalog_version.to_string()),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for entry in &self.apis {
+            if !seen.insert(entry.id.as_str()) {
+                return Err(PlatformError::api_catalog(
+                    ApiCatalogFailure::new(
+                        ApiCatalogCode::DuplicateApiId,
+                        format!("API `{}` is listed more than once", entry.id),
+                    )
+                    .with_detail(entry.id.clone()),
+                ));
+            }
+            if entry.api_version != HOST_API_VERSION {
+                return Err(PlatformError::api_catalog(
+                    ApiCatalogFailure::new(
+                        ApiCatalogCode::UnsupportedApiVersion,
+                        format!(
+                            "API `{}` declares version {}; this build supports {HOST_API_VERSION}",
+                            entry.id, entry.api_version
+                        ),
+                    )
+                    .with_detail(entry.id.clone()),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns the machine-readable catalog of host APIs implemented by this build.
+pub fn api_catalog() -> ApiCatalog {
+    ApiCatalog::from_registry()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModFailureCode {
@@ -307,12 +746,21 @@ pub enum PlatformError {
     RuntimeSetup(String),
     #[error("Wasm module for Mod `{mod_id}` is invalid: {message}")]
     WasmModule { mod_id: String, message: String },
+    #[error("Mod `{mod_id}` imports `{api_id}` with signature `{found}`, expected `{expected}`")]
+    ApiSignatureMismatch {
+        mod_id: String,
+        api_id: String,
+        expected: String,
+        found: String,
+    },
     #[error("failed to encode load plan: {0}")]
     Serialization(String),
     #[error("invalid embedded schema: {0}")]
     InvalidSchema(String),
     #[error("lock file failure: {0}")]
     LockFile(Box<LockFileFailure>),
+    #[error("API catalog failure: {0}")]
+    ApiCatalog(Box<ApiCatalogFailure>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,9 +773,11 @@ pub enum PlatformErrorCode {
     DependencyResolution,
     RuntimeSetup,
     WasmModule,
+    ApiSignatureMismatch,
     Serialization,
     InvalidSchema,
     LockFile,
+    ApiCatalog,
 }
 
 impl PlatformErrorCode {
@@ -341,9 +791,11 @@ impl PlatformErrorCode {
             Self::DependencyResolution => "platform.dependency_resolution",
             Self::RuntimeSetup => "platform.runtime_setup",
             Self::WasmModule => "platform.wasm_module",
+            Self::ApiSignatureMismatch => "platform.api_signature_mismatch",
             Self::Serialization => "platform.serialization",
             Self::InvalidSchema => "platform.invalid_schema",
             Self::LockFile => "platform.lock_file",
+            Self::ApiCatalog => "platform.api_catalog",
         }
     }
 }
@@ -362,6 +814,12 @@ impl PlatformError {
         Self::LockFile(Box::new(failure))
     }
 
+    /// Builds an API catalog failure with the same boxing rationale as
+    /// [`PlatformError::dependency`].
+    fn api_catalog(failure: ApiCatalogFailure) -> Self {
+        Self::ApiCatalog(Box::new(failure))
+    }
+
     pub const fn code(&self) -> PlatformErrorCode {
         match self {
             Self::Io { .. } => PlatformErrorCode::Io,
@@ -372,9 +830,11 @@ impl PlatformError {
             Self::DependencyResolution(_) => PlatformErrorCode::DependencyResolution,
             Self::RuntimeSetup(_) => PlatformErrorCode::RuntimeSetup,
             Self::WasmModule { .. } => PlatformErrorCode::WasmModule,
+            Self::ApiSignatureMismatch { .. } => PlatformErrorCode::ApiSignatureMismatch,
             Self::Serialization(_) => PlatformErrorCode::Serialization,
             Self::InvalidSchema(_) => PlatformErrorCode::InvalidSchema,
             Self::LockFile(_) => PlatformErrorCode::LockFile,
+            Self::ApiCatalog(_) => PlatformErrorCode::ApiCatalog,
         }
     }
 }
@@ -1047,28 +1507,35 @@ impl LoadedWasmMod {
             }
         })?;
         for import in module.imports() {
-            let required_permission = match (import.module(), import.name()) {
-                ("gk", "counter_read") => "world.read",
-                ("gk", "counter_set") => "world.command",
-                _ => {
-                    return Err(PlatformError::WasmModule {
-                        mod_id: package.manifest.id.clone(),
-                        message: format!(
-                            "unsupported import `{}::{}`; only the `gk` counter Host API is available",
-                            import.module(),
-                            import.name()
-                        ),
-                    });
-                }
+            let Some(api) = find_host_api(import.module(), import.name()) else {
+                return Err(PlatformError::WasmModule {
+                    mod_id: package.manifest.id.clone(),
+                    message: format!(
+                        "unsupported import `{}::{}`; only the `gk` counter Host API is available",
+                        import.module(),
+                        import.name()
+                    ),
+                });
             };
+            // The registered signature is part of the contract: an import with
+            // the right name but the wrong guest signature is rejected before
+            // the Mod ever runs.
+            if !host_api_signature_matches(api, &import) {
+                return Err(PlatformError::ApiSignatureMismatch {
+                    mod_id: package.manifest.id.clone(),
+                    api_id: api.id.to_owned(),
+                    expected: describe_signature(&api.signature),
+                    found: describe_import_signature(&import),
+                });
+            }
             if !package
                 .manifest
                 .requested_permissions
-                .contains(required_permission)
+                .contains(api.permission)
             {
                 return Err(PlatformError::PermissionNotRequested {
                     mod_id: package.manifest.id.clone(),
-                    permission: required_permission.to_owned(),
+                    permission: api.permission.to_owned(),
                 });
             }
         }
@@ -1201,6 +1668,95 @@ fn new_store(engine: &Engine, current_counter: i64) -> Result<Store<HostState>, 
     Ok(store)
 }
 
+/// Maps an actual Wasmtime import type to the registry's value-kind domain.
+///
+/// Returns `None` for any Wasm type the registry cannot express in the current
+/// subset (references, etc.), which is treated as a signature mismatch.
+fn wasm_value_kind(value: &wasmtime::ValType) -> Option<WasmValueKind> {
+    match value {
+        wasmtime::ValType::I32 => Some(WasmValueKind::I32),
+        wasmtime::ValType::I64 => Some(WasmValueKind::I64),
+        wasmtime::ValType::F32 => Some(WasmValueKind::F32),
+        wasmtime::ValType::F64 => Some(WasmValueKind::F64),
+        wasmtime::ValType::V128 => Some(WasmValueKind::V128),
+        wasmtime::ValType::Ref(_) => None,
+    }
+}
+
+/// Extracts the value kinds of an import's actual `FuncType`, or `None` if the
+/// import is not a function or uses an unsupported Wasm type.
+fn import_value_kinds(
+    import: &wasmtime::ImportType<'_>,
+) -> Option<(Vec<WasmValueKind>, Vec<WasmValueKind>)> {
+    let extern_type = import.ty();
+    let func = extern_type.func()?;
+    let params = func
+        .params()
+        .map(|ty| wasm_value_kind(&ty))
+        .collect::<Option<Vec<_>>>()?;
+    let results = func
+        .results()
+        .map(|ty| wasm_value_kind(&ty))
+        .collect::<Option<Vec<_>>>()?;
+    Some((params, results))
+}
+
+/// True when a registry descriptor's declared signature equals the import's
+/// actual Wasm signature.
+fn host_api_signature_matches(api: &HostApiDescriptor, import: &wasmtime::ImportType<'_>) -> bool {
+    match import_value_kinds(import) {
+        Some((params, results)) => {
+            api.signature.params.matches_actual(&params)
+                && api.signature.results.matches_actual(&results)
+        }
+        None => false,
+    }
+}
+
+/// Renders a registry signature as `params -> results`.
+fn describe_signature(signature: &HostApiSignature) -> String {
+    let params = signature
+        .params
+        .iter()
+        .map(WasmValueKind::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let results = signature
+        .results
+        .iter()
+        .map(WasmValueKind::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({params}) -> ({results})")
+}
+
+/// Renders an import's actual signature as `params -> results`.
+fn describe_import_signature(import: &wasmtime::ImportType<'_>) -> String {
+    match import_value_kinds(import) {
+        Some((params, results)) => {
+            let params = params
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let results = results
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({params}) -> ({results})")
+        }
+        None => "non-function import or unsupported value type".to_owned(),
+    }
+}
+
+/// Builds the Wasm `Linker` for host API calls.
+///
+/// Every `func_wrap` here must correspond to exactly one [`HostApiDescriptor`]
+/// in [`HOST_APIS`]: the contract tests enumerate this linker's entries and
+/// their real signatures and fail if the two sets diverge. The registrations
+/// are kept explicit rather than driven by a dynamic loop because each closure
+/// has a distinct Rust type; the test, not the runtime, enforces sameness.
 fn new_linker(engine: &Engine) -> Result<Linker<HostState>, String> {
     let mut linker = Linker::new(engine);
     linker
@@ -1224,6 +1780,51 @@ fn new_linker(engine: &Engine) -> Result<Linker<HostState>, String> {
         )
         .map_err(|error| error.to_string())?;
     Ok(linker)
+}
+
+/// Test-only introspection of the **real** Wasm `Linker` built by the Platform.
+///
+/// Enumerates `Linker::iter`, returning `(module, field, rendered_signature)`
+/// for every registered function. This lets contract tests compare the runtime
+/// allow-list against the Registry/Catalog without a hand-written key list.
+pub fn linker_registration_probe() -> Result<Vec<(String, String, String)>, String> {
+    let engine = create_wasm_engine().map_err(|error| error.to_string())?;
+    let mut store = new_store(&engine, 0)?;
+    let linker = new_linker(&engine)?;
+    // Materialize the raw entries first so the mutable borrow of `store` used by
+    // `Linker::iter` ends before each item's type is queried.
+    let raw = linker
+        .iter(&mut store)
+        .map(|(module, field, item)| (module.to_owned(), field.to_owned(), item))
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    for (module, field, item) in raw {
+        let signature = match item.ty(&store) {
+            wasmtime::ExternType::Func(func) => {
+                let params = func
+                    .params()
+                    .map(|ty| {
+                        wasm_value_kind(&ty)
+                            .map_or_else(|| "?".to_owned(), |k| k.as_str().to_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let results = func
+                    .results()
+                    .map(|ty| {
+                        wasm_value_kind(&ty)
+                            .map_or_else(|| "?".to_owned(), |k| k.as_str().to_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({params}) -> ({results})")
+            }
+            other => format!("{other:?}"),
+        };
+        entries.push((module, field, signature));
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 fn validate_module(engine: &Engine, module: &Module, mod_id: &str) -> Result<(), PlatformError> {
@@ -1268,11 +1869,11 @@ fn validate_manifest(manifest: &ModManifest) -> Result<(), PlatformError> {
             manifest.kernel_api
         )));
     }
-    let allowed = BTreeSet::from(["world.read".to_owned(), "world.command".to_owned()]);
+    let allowed = all_host_api_permissions();
     if let Some(permission) = manifest
         .requested_permissions
         .iter()
-        .find(|permission| !allowed.contains(*permission))
+        .find(|permission| !allowed.contains(permission.as_str()))
     {
         return Err(PlatformError::InvalidManifest(format!(
             "unsupported requested permission `{permission}`"
@@ -1331,6 +1932,29 @@ fn validate_lock_file_schema(value: &serde_json::Value) -> Result<(), PlatformEr
                 "schema violation at `{}`: {error}",
                 error.instance_path()
             )),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a serialized catalog value against the embedded v1 catalog schema.
+///
+/// Exposed for contract tests so they can prove the exported bytes satisfy the
+/// published schema; the Platform itself builds the catalog from code.
+pub fn validate_api_catalog_value(value: &serde_json::Value) -> Result<(), String> {
+    static VALIDATOR: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../schemas/mod-api-catalog-v1.schema.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+    });
+    let validator = validator.as_ref().map_err(|error| error.clone())?;
+    if let Err(error) = validator.validate(value) {
+        return Err(format!(
+            "api catalog schema violation at `{}`: {error}",
+            error.instance_path()
         ));
     }
     Ok(())
@@ -1447,6 +2071,56 @@ mod tests {
 
     fn sample_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mods/p1-counter")
+    }
+
+    #[test]
+    fn registry_is_internally_consistent() {
+        validate_registry().expect("the built-in registry must be self-consistent");
+    }
+
+    #[test]
+    fn api_catalog_is_sorted_stable_and_verifies() {
+        let catalog = api_catalog();
+        catalog.verify().expect("built catalog must verify");
+        let ids = catalog
+            .apis
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "catalog entries must be sorted by API ID");
+        assert_eq!(
+            catalog.to_bytes().unwrap(),
+            catalog.to_bytes().unwrap(),
+            "catalog serialization must be deterministic"
+        );
+    }
+
+    #[test]
+    fn api_catalog_only_exports_implemented_apis() {
+        let catalog = api_catalog();
+        // Exactly the two host APIs this build implements; nothing implied by
+        // the wider specification may appear here.
+        assert_eq!(catalog.apis.len(), 2);
+        assert_eq!(catalog.apis[0].id, "gk::counter_read");
+        assert_eq!(catalog.apis[1].id, "gk::counter_set");
+    }
+
+    #[test]
+    fn api_catalog_rejects_unsupported_version() {
+        let mut catalog = api_catalog();
+        catalog.catalog_version = 999;
+        assert_eq!(
+            catalog.verify().unwrap_err().code(),
+            PlatformErrorCode::ApiCatalog
+        );
+        let mut catalog = api_catalog();
+        catalog.apis[0].api_version = 999;
+        assert_eq!(
+            catalog.verify().unwrap_err().code(),
+            PlatformErrorCode::ApiCatalog
+        );
     }
 
     #[test]
