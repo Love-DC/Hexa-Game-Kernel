@@ -1,7 +1,7 @@
 # P3 任务卡：Mod Platform 基线
 
 - 阶段：P3
-- 状态：P3 执行中；GK-P3-01 已通过本地与 Gitee Go 验收，GK-P3-02 本地门禁通过、远端 Gitee Go 待确认
+- 状态：P3 执行中；GK-P3-01 已通过本地与 Gitee Go 验收，GK-P3-02 已通过本地门禁与远端 Gitee Go 验收（构建 #11/#13，2026-10-14 确认）
 - 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
 - 当前代码基线：`crates/platform-core` 包含严格 JSON Manifest 解析、本地目录发现、必需依赖 SemVer 校验、确定性拓扑解析、内存 LoadPlan、宿主权限授权和 Wasmtime 适配；目前仅有 `gk::counter_read` / `gk::counter_set` 两个 Host API。
 - 规范边界：仓库内独立的 `Mod Platform Specification v1.0.md` 是空文件；本卡以完整项目规范为依据。不得静默填充空文件或将未决字段假装成既有契约。
@@ -97,12 +97,12 @@ P3 只有在 P3-01 至 P3-07 的契约和验收逐项通过后才完成。仅有
 - **状态：** 已通过 Gitee Go（用户确认 `b176d33` 与 `a872a1c` 均构建成功）。
 - **结论：** `jsonschema` 锁定依赖在 Gitee Go 环境可用；GK-P3-01 远端门禁通过。`a872a1c` 同时验证了 Resolver 诊断排序增量的云端编译。
 
-### GK-P3-02 — Resolver 与依赖契约（本地门禁通过，远端待确认）
+### GK-P3-02 — Resolver 与依赖契约（本地门禁与远端 Gitee Go 均已通过）
 
 - **已冻结的既有行为：** 每个 Mod ID 只接受一个候选包；重复 ID 拒绝，不进行版本挑选；必需直接依赖必须存在且满足 SemVer；依赖必须先于依赖者加载；同一拓扑层按 Mod ID 字典序稳定排序；循环（包含自依赖）拒绝整份计划。
 - **实现进展：** Resolver 校验 Manifest 依赖时按依赖 ID、版本范围排序，使多个错误同时存在时选出的诊断不依赖 JSON 数组顺序；LoadPlan 中依赖 ID 已排序。提交 `a872a1c` 已通过本地 `cargo check --locked --workspace` 与 Gitee Go。
 - **本轮实现：** 依赖解析失败从诊断字符串改为结构化载荷。新增 `DependencyResolutionCode`（`platform.dependency.duplicate_mod_id` / `duplicate_dependency` / `missing_dependency` / `invalid_version_requirement` / `version_incompatible` / `cycle`）与 `DependencyResolutionFailure`（`code`、`mod_id`、`dependency_id`、`requirement`、`found_version`、确定性 `cycle` 路径、仅诊断用的 `message`）。顶层 `PlatformErrorCode::DependencyResolution`（`platform.dependency_resolution`）保持不变；载荷装箱以控制错误变体尺寸。新增 `find_dependency_cycle`：仅在未解析集合内向最小未解析依赖前进，输出与候选输入顺序无关的完整循环路径（自依赖输出 `X -> X`）。重复 Mod ID 明确拒绝且不替调用方挑选候选。
 - **测试：** 单元测试覆盖重复 Mod ID（含候选顺序互换后诊断一致）、重复依赖、缺失依赖、SemVer 不匹配（含 requirement/found 字段）、非法版本范围、自依赖、多节点循环、含环子图不掩盖可排序子图、菱形图 24 种候选排列产生同一计划、重复运行一致、故障载荷序列化字段稳定；集成测试 `tests/resolver_contract.rs` 用 `tests/fixtures/dep-graph`（真实磁盘包）验证锁定顺序、旋转/反转候选顺序同计划，用 `tests/fixtures/dep-graph-broken` 验证缺失必需依赖导致整计划失败并携带关联标识。
 - **本地门禁：** `cargo fmt --all -- --check`、`cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo test --locked --workspace`（Platform 单元 23 项、集成 `p1_vertical_slice` 3 项、集成 `resolver_contract` 3 项、Kernel 14 项，全部通过）、`cargo run --locked -p game-platform -- demo`（`verified=true`）均通过。
-- **远端门禁：** 尚未确认。需用户确认本次提交的 Gitee Go 构建。
+- **远端门禁（2026-10-14 证据更新，P3-10 文档维护）：** **已确认通过**。最终增量提交 `6e7c7cf`（`Structure dependency resolution failures`，2026-10-13 09:35:18 推送）对应 Gitee Go 构建 **#13**（流水线 `game-kernel-rust-ci`，分支 `main`，Webhook 触发），于 **2026-10-13 09:35:30 (+08:00) 成功**，用户已明确确认。前置增量 `a872a1c` 此前已由构建 **#11** 确认成功（见 GK-P3-01 远端验收）。~~**远端门禁：** 尚未确认。需用户确认本次提交的 Gitee Go 构建。~~（2026-10-13 撰写时的历史记录，已被构建 #13 证据取代。）
 - **未决边界：** 多版本 side-by-side、可选依赖、Mod 间公开 API 依赖和 Provider 选择仍不支持；`DependencyResolutionFailure` 的持久报告 Schema 属 GK-P3-06。
