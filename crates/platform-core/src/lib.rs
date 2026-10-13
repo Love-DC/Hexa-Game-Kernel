@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wasmtime::{
-    Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, WasmFeatures,
+    Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    WasmFeatures,
 };
 
 /// Re-export of the Wasmtime engine type so external consumers and contract
@@ -471,12 +472,52 @@ pub fn api_catalog() -> ApiCatalog {
     ApiCatalog::from_registry()
 }
 
+/// Stable failure codes for a Mod's Wasm execution, as surfaced through the
+/// Kernel `SystemError.code` field.
+///
+/// GK-P3-06 refines the previously blanket `ExecutionFailed` mapping: a runtime
+/// failure now reports its frozen §3.2/§3.3 stable code. `ExecutionFailed`
+/// remains as the conservative fallback for a runtime failure whose trap cannot
+/// be classified. The message is never consulted for classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModFailureCode {
     RuntimeSetup,
+    /// Conservative fallback: a runtime failure not otherwise classified.
     ExecutionFailed,
     InvalidOutput,
     InvalidWorldState,
+    /// Frozen §3.3 C.1: runtime fuel exhaustion (`Trap::OutOfFuel`).
+    FuelExceeded,
+    /// Frozen §3.3 C.1: runtime linear-memory out of bounds (`Trap::MemoryOutOfBounds`).
+    MemoryOutOfBounds,
+    /// Frozen §3.3 C.1: runtime stack exhaustion (`Trap::StackOverflow`).
+    StackExceeded,
+    /// Frozen §3.3 C.1: resource quota exceeded (commands/events/tasks; future).
+    QuotaExceeded,
+    /// Frozen §3.2: guest `unreachable` (`Trap::UnreachableCodeReached`).
+    GuestTrapUnreachable,
+    /// Frozen §3.2: guest integer overflow (`Trap::IntegerOverflow`).
+    GuestTrapIntegerOverflow,
+    /// Frozen §3.2: guest integer divide by zero (`Trap::IntegerDivisionByZero`).
+    GuestTrapIntegerDivideByZero,
+    /// Frozen §3.2: guest bad conversion to integer (`Trap::BadConversionToInteger`).
+    GuestTrapInvalidConversion,
+    /// Frozen §3.2: guest interrupt (`Trap::Interrupt`); the only retryable trap.
+    GuestTrapInterrupted,
+    /// Frozen §3.2: any other enabled trap variant (`other` group).
+    GuestTrapOther,
+    /// Frozen §3.2: a `#[non_exhaustive]` trap variant unknown to this build.
+    GuestTrapUnknown,
+    /// Frozen §3.2/D: host API invocation failure.
+    ApiInvocationFailed,
+    /// Frozen §3.3 C.2: instantiation-phase linear-memory limit exceeded.
+    MemoryLimitExceeded,
+    /// Frozen §3.3 C.2: instantiation-phase Wasm stack limit exceeded.
+    StackLimitExceeded,
+    /// Frozen §3 row 6 (LoadError): module failed to load/instantiate.
+    LoadFailed,
+    /// Frozen §3 row 7 (InitializationError): Mod initialization failed.
+    InitializationFailed,
 }
 
 impl ModFailureCode {
@@ -486,8 +527,746 @@ impl ModFailureCode {
             Self::ExecutionFailed => "platform.mod.execution_failed",
             Self::InvalidOutput => "platform.mod.invalid_output",
             Self::InvalidWorldState => "platform.mod.invalid_world_state",
+            Self::FuelExceeded => "platform.mod.resource.fuel_exceeded",
+            Self::MemoryOutOfBounds => "platform.mod.resource.memory_out_of_bounds",
+            Self::StackExceeded => "platform.mod.resource.stack_exceeded",
+            Self::QuotaExceeded => "platform.mod.resource.quota_exceeded",
+            Self::GuestTrapUnreachable => "platform.mod.guest_trap.unreachable",
+            Self::GuestTrapIntegerOverflow => "platform.mod.guest_trap.integer_overflow",
+            Self::GuestTrapIntegerDivideByZero => "platform.mod.guest_trap.integer_divide_by_zero",
+            Self::GuestTrapInvalidConversion => "platform.mod.guest_trap.invalid_conversion",
+            Self::GuestTrapInterrupted => "platform.mod.guest_trap.interrupted",
+            Self::GuestTrapOther => "platform.mod.guest_trap.other",
+            Self::GuestTrapUnknown => "platform.mod.guest_trap.unknown",
+            Self::ApiInvocationFailed => "platform.mod.api.invocation_failed",
+            Self::MemoryLimitExceeded => "platform.mod.resource.memory_limit_exceeded",
+            Self::StackLimitExceeded => "platform.mod.resource.stack_limit_exceeded",
+            Self::LoadFailed => "platform.mod.load_failed",
+            Self::InitializationFailed => "platform.mod.initialization_failed",
         }
     }
+
+    /// Maps a stable code produced by [`classify_instantiation_error`] back to a
+    /// [`ModFailureCode`], falling back to `LoadFailed` for anything else.
+    fn from_instantiation_code(code: &str) -> Self {
+        match code {
+            "platform.mod.resource.memory_limit_exceeded" => Self::MemoryLimitExceeded,
+            "platform.mod.resource.stack_limit_exceeded" => Self::StackLimitExceeded,
+            "platform.mod.resource.fuel_exceeded" => Self::FuelExceeded,
+            "platform.mod.resource.memory_out_of_bounds" => Self::MemoryOutOfBounds,
+            "platform.mod.resource.stack_exceeded" => Self::StackExceeded,
+            _ => Self::LoadFailed,
+        }
+    }
+
+    /// Maps a runtime [`Trap`] to the frozen stable code (see [`classify_runtime_trap`]).
+    pub const fn from_trap(trap: &Trap) -> Self {
+        match trap {
+            Trap::OutOfFuel => Self::FuelExceeded,
+            Trap::MemoryOutOfBounds => Self::MemoryOutOfBounds,
+            Trap::StackOverflow => Self::StackExceeded,
+            Trap::UnreachableCodeReached => Self::GuestTrapUnreachable,
+            Trap::IntegerOverflow => Self::GuestTrapIntegerOverflow,
+            Trap::IntegerDivisionByZero => Self::GuestTrapIntegerDivideByZero,
+            Trap::BadConversionToInteger => Self::GuestTrapInvalidConversion,
+            Trap::Interrupt => Self::GuestTrapInterrupted,
+            Trap::TableOutOfBounds
+            | Trap::IndirectCallToNull
+            | Trap::BadSignature
+            | Trap::NullReference => Self::GuestTrapOther,
+            _ => Self::GuestTrapUnknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GK-P3-06: unified, versioned fault report contract.
+//
+// Design source: planning/16-P3-06-故障报告契约设计提案.md (rev2, FROZEN) and
+// planning/drafts/mod-fault-report-v1.schema.DRAFT.json. The report is a
+// Platform-owned type (`ModFaultReport`); the Kernel does NOT depend on it and
+// performs no reverse conversion. `message` is human-readable only and is NOT a
+// machine protocol field: every machine decision (category, phase, severity,
+// disposition, retryability, authority) is derived from the stable `code`,
+// never from `message` text.
+// ---------------------------------------------------------------------------
+
+/// Version of the [`ModFaultReport`] document format.
+pub const FAULT_REPORT_VERSION: u32 = 1;
+
+/// The fourteen error categories required by `Mod Platform Specification` §12.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultCategory {
+    Manifest,
+    Package,
+    Dependency,
+    VersionConflict,
+    Permission,
+    Load,
+    Initialization,
+    ApiRegistration,
+    ApiInvocation,
+    WasmTrap,
+    ResourceLimit,
+    /// Category reserved for §12.1 `DeterminismViolation`.
+    ///
+    /// NOTE: only the category and its stable code exist in this build. The
+    /// actual violation-detection capability is NOT implemented (see the
+    /// O-6-1 unmet item in the frozen design). No detection result may be
+    /// fabricated for this category.
+    Determinism,
+    Lifecycle,
+    /// Category reserved for §12.1 `MigrationError`.
+    ///
+    /// NOTE: only the category and its stable code exist in this build. The
+    /// actual migration-failure detection capability is NOT implemented (see
+    /// the O-6-2 unmet item in the frozen design). No detection result may be
+    /// fabricated for this category.
+    Migration,
+}
+
+impl FaultCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Package => "package",
+            Self::Dependency => "dependency",
+            Self::VersionConflict => "version_conflict",
+            Self::Permission => "permission",
+            Self::Load => "load",
+            Self::Initialization => "initialization",
+            Self::ApiRegistration => "api_registration",
+            Self::ApiInvocation => "api_invocation",
+            Self::WasmTrap => "wasm_trap",
+            Self::ResourceLimit => "resource_limit",
+            Self::Determinism => "determinism",
+            Self::Lifecycle => "lifecycle",
+            Self::Migration => "migration",
+        }
+    }
+}
+
+/// Lifecycle stage in which a fault occurred (§12.4 "错误发生阶段").
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultPhase {
+    Discovery,
+    Manifest,
+    Package,
+    Resolution,
+    Lockfile,
+    Permission,
+    Compile,
+    Instantiation,
+    Registration,
+    Initialization,
+    Execution,
+    Teardown,
+}
+
+impl FaultPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Manifest => "manifest",
+            Self::Package => "package",
+            Self::Resolution => "resolution",
+            Self::Lockfile => "lockfile",
+            Self::Permission => "permission",
+            Self::Compile => "compile",
+            Self::Instantiation => "instantiation",
+            Self::Registration => "registration",
+            Self::Initialization => "initialization",
+            Self::Execution => "execution",
+            Self::Teardown => "teardown",
+        }
+    }
+}
+
+/// Fault-handling scope (§12.2 / Security spec §6.1: L1 call .. L4 runtime).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeverityGrade {
+    L1Call,
+    L2Task,
+    L3Mod,
+    L4Runtime,
+}
+
+impl SeverityGrade {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::L1Call => "l1_call",
+            Self::L2Task => "l2_task",
+            Self::L3Mod => "l3_mod",
+            Self::L4Runtime => "l4_runtime",
+        }
+    }
+}
+
+/// What the platform should do next for a fault (task card: continue/stop/rebuild).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Continue,
+    Stop,
+    Rebuild,
+}
+
+impl Disposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Stop => "stop",
+            Self::Rebuild => "rebuild",
+        }
+    }
+}
+
+/// Structured recovery advice (enum, never free text).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAdvice {
+    None,
+    RetryCall,
+    DisableMod,
+    RebuildInstance,
+    RestoreCheckpoint,
+    FixManifest,
+    FixPackage,
+}
+
+impl RecoveryAdvice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RetryCall => "retry_call",
+            Self::DisableMod => "disable_mod",
+            Self::RebuildInstance => "rebuild_instance",
+            Self::RestoreCheckpoint => "restore_checkpoint",
+            Self::FixManifest => "fix_manifest",
+            Self::FixPackage => "fix_package",
+        }
+    }
+}
+
+/// Resource budget kinds of `Mod Platform Specification` §10.1.
+///
+/// The current default values are configurable and are NOT a frozen contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    FuelPerCall,
+    PerTickFuel,
+    Memory,
+    CommandsPerTick,
+    EventsPerTick,
+    Tasks,
+    ApiCalls,
+    PersistentBytes,
+    LogBytes,
+}
+
+impl LimitKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FuelPerCall => "fuel_per_call",
+            Self::PerTickFuel => "per_tick_fuel",
+            Self::Memory => "memory",
+            Self::CommandsPerTick => "commands_per_tick",
+            Self::EventsPerTick => "events_per_tick",
+            Self::Tasks => "tasks",
+            Self::ApiCalls => "api_calls",
+            Self::PersistentBytes => "persistent_bytes",
+            Self::LogBytes => "log_bytes",
+        }
+    }
+}
+
+/// Resource usage attached to a fault report when a budget was involved.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceUse {
+    pub limit_kind: LimitKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_value: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<u64>,
+    /// Version of the budget configuration the values came from (Security spec §5.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<u32>,
+    pub exceeded: bool,
+}
+
+/// Dependency context attached to a fault report when dependencies are involved.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycle: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_consumers: Vec<String>,
+}
+
+/// Rollback / recovery outcome (§12.4 "是否已执行回滚或恢复").
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackOutcome {
+    pub executed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub succeeded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_work: Option<bool>,
+}
+
+/// Versioned, machine-readable Platform fault report.
+///
+/// Independent of the Kernel's `SystemError`. `message` is human-readable only
+/// and is not a machine protocol field.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModFaultReport {
+    pub report_version: u32,
+    pub code: String,
+    pub category: FaultCategory,
+    pub phase: FaultPhase,
+    pub severity_grade: SeverityGrade,
+    pub disposition: Disposition,
+    pub authoritative: bool,
+    pub retryable: bool,
+    pub recovery_advice: RecoveryAdvice,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_api_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_plan_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_context: Option<DependencyContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<RollbackOutcome>,
+
+    pub message: String,
+}
+
+impl ModFaultReport {
+    /// Builds a report from a stable code and the derived machine decision.
+    ///
+    /// The decision (category/phase/severity/disposition/retryable/advice and
+    /// authority) is looked up from the frozen mapping table by `code`; it is
+    /// never derived from `message`.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let code = code.into();
+        let decision = fault_decision(&code);
+        Self {
+            report_version: FAULT_REPORT_VERSION,
+            code,
+            category: decision.category,
+            phase: decision.phase,
+            severity_grade: decision.severity_grade,
+            disposition: decision.disposition,
+            authoritative: decision.authoritative,
+            retryable: decision.retryable,
+            recovery_advice: decision.recovery_advice,
+            mod_id: None,
+            mod_version: None,
+            manifest_version: None,
+            kernel_api_version: None,
+            platform_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            load_plan_id: None,
+            instance_id: None,
+            content_digest: None,
+            tick: None,
+            scheduler_context: None,
+            api_id: None,
+            system_id: None,
+            resource: None,
+            dependency_context: None,
+            rollback: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_mod_id(mut self, mod_id: impl Into<String>) -> Self {
+        self.mod_id = Some(mod_id.into());
+        self
+    }
+
+    pub fn with_content_digest(mut self, digest: impl Into<String>) -> Self {
+        self.content_digest = Some(digest.into());
+        self
+    }
+
+    pub fn with_tick(mut self, tick: u64) -> Self {
+        self.tick = Some(tick);
+        self
+    }
+
+    pub fn with_resource(mut self, resource: ResourceUse) -> Self {
+        self.resource = Some(resource);
+        self
+    }
+
+    pub fn with_dependency_context(mut self, context: DependencyContext) -> Self {
+        self.dependency_context = Some(context);
+        self
+    }
+
+    pub fn with_rollback(mut self, rollback: RollbackOutcome) -> Self {
+        self.rollback = Some(rollback);
+        self
+    }
+
+    /// Fills Mod identity fields from a manifest.
+    pub fn with_manifest(mut self, manifest: &ModManifest) -> Self {
+        self.mod_id = Some(manifest.id.clone());
+        self.mod_version = Some(manifest.version.clone());
+        self.manifest_version = Some(manifest.manifest_version);
+        self.kernel_api_version = Some(manifest.kernel_api.clone());
+        self
+    }
+
+    /// Serializes the report to its canonical, Schema-validatable JSON form.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(self).expect("fault report serializes");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// Maps a Kernel `SystemError` to a Platform report.
+    ///
+    /// This is a one-way read: the Kernel never depends on [`ModFaultReport`],
+    /// and no reverse conversion is provided. Per the frozen §6.2 mapping:
+    /// `code` -> `code`; `system` -> `system_id`; `tick` -> `tick`;
+    /// `source_digest` -> `content_digest`; `message` is copied verbatim into
+    /// the report's non-protocol `message` field.
+    pub fn from_system_error(error: &SystemError) -> Self {
+        let mut report =
+            Self::new(error.code.clone(), error.message.clone()).with_tick(error.tick.0);
+        report.system_id = Some(error.system.clone());
+        if let Some(digest) = &error.source_digest {
+            report.content_digest = Some(digest.clone());
+        }
+        report
+    }
+
+    /// Maps a Platform error to a report using the frozen category mapping.
+    pub fn from_platform_error(error: &PlatformError) -> Self {
+        let code = error.fault_code();
+        let mut report = Self::new(code, error.to_string());
+        match error {
+            PlatformError::PermissionDenied { mod_id, .. }
+            | PlatformError::PermissionNotRequested { mod_id, .. }
+            | PlatformError::WasmModule { mod_id, .. }
+            | PlatformError::ApiSignatureMismatch { mod_id, .. }
+            | PlatformError::ModLoad { mod_id, .. } => report.mod_id = Some(mod_id.clone()),
+            PlatformError::Lifecycle(failure) => {
+                report.mod_id = failure.mod_id.clone();
+            }
+            PlatformError::DependencyResolution(failure) => {
+                report.mod_id = failure.mod_id.clone();
+                report.dependency_context = Some(DependencyContext {
+                    dependency_id: failure.dependency_id.clone(),
+                    required: Some(true),
+                    cycle: failure.cycle.clone(),
+                    affected_consumers: Vec::new(),
+                });
+            }
+            PlatformError::LockFile(failure) => {
+                report.mod_id = failure.mod_id.clone();
+            }
+            _ => {}
+        }
+        report
+    }
+}
+
+/// The machine decision derived from a stable code (see frozen §3/§4/§5 tables).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FaultDecision {
+    category: FaultCategory,
+    phase: FaultPhase,
+    severity_grade: SeverityGrade,
+    disposition: Disposition,
+    authoritative: bool,
+    retryable: bool,
+    recovery_advice: RecoveryAdvice,
+}
+
+/// Looks up the frozen decision for a stable code.
+///
+/// A code outside the frozen table is treated conservatively as a runtime-level
+/// fault that must rebuild and cannot be safely continued (§5 row 8: never
+/// default to `continue`).
+fn fault_decision(code: &str) -> FaultDecision {
+    let (category, phase, severity_grade, disposition, authoritative, retryable, recovery_advice) =
+        match code {
+            "platform.invalid_manifest" => (
+                FaultCategory::Manifest,
+                FaultPhase::Manifest,
+                SeverityGrade::L1Call,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::FixManifest,
+            ),
+            "platform.invalid_package" => (
+                FaultCategory::Package,
+                FaultPhase::Package,
+                SeverityGrade::L1Call,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::FixPackage,
+            ),
+            "platform.dependency_resolution"
+            | "platform.dependency.duplicate_mod_id"
+            | "platform.dependency.duplicate_dependency"
+            | "platform.dependency.missing_dependency"
+            | "platform.dependency.invalid_version_requirement"
+            | "platform.dependency.cycle" => (
+                FaultCategory::Dependency,
+                FaultPhase::Resolution,
+                SeverityGrade::L1Call,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::FixManifest,
+            ),
+            "platform.dependency.version_incompatible" => (
+                FaultCategory::VersionConflict,
+                FaultPhase::Resolution,
+                SeverityGrade::L1Call,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::FixManifest,
+            ),
+            "platform.permission_denied" | "platform.permission_not_requested" => (
+                FaultCategory::Permission,
+                FaultPhase::Permission,
+                SeverityGrade::L1Call,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::FixManifest,
+            ),
+            "platform.mod.load_failed" => (
+                FaultCategory::Load,
+                FaultPhase::Instantiation,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.mod.initialization_failed" => (
+                FaultCategory::Initialization,
+                FaultPhase::Initialization,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.api_catalog" | "platform.api_signature_mismatch" | "platform.wasm_module" => {
+                (
+                    FaultCategory::ApiRegistration,
+                    FaultPhase::Registration,
+                    SeverityGrade::L2Task,
+                    Disposition::Stop,
+                    false,
+                    false,
+                    RecoveryAdvice::DisableMod,
+                )
+            }
+            "platform.mod.api.invocation_failed" => (
+                FaultCategory::ApiInvocation,
+                FaultPhase::Execution,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.mod.guest_trap.interrupted" => (
+                FaultCategory::WasmTrap,
+                FaultPhase::Execution,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                true,
+                RecoveryAdvice::RetryCall,
+            ),
+            c if c.starts_with("platform.mod.guest_trap.")
+                || c == "platform.mod.invalid_world_state"
+                || c == "platform.mod.invalid_output"
+                || c == "platform.mod.execution_failed" =>
+            {
+                (
+                    FaultCategory::WasmTrap,
+                    FaultPhase::Execution,
+                    SeverityGrade::L2Task,
+                    Disposition::Stop,
+                    false,
+                    false,
+                    RecoveryAdvice::DisableMod,
+                )
+            }
+            "platform.mod.resource.fuel_exceeded" => (
+                FaultCategory::ResourceLimit,
+                FaultPhase::Execution,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                true,
+                RecoveryAdvice::RetryCall,
+            ),
+            "platform.mod.resource.memory_limit_exceeded"
+            | "platform.mod.resource.stack_limit_exceeded" => (
+                FaultCategory::ResourceLimit,
+                FaultPhase::Instantiation,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.mod.resource.memory_out_of_bounds"
+            | "platform.mod.resource.stack_exceeded"
+            | "platform.mod.resource.quota_exceeded" => (
+                FaultCategory::ResourceLimit,
+                FaultPhase::Execution,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.mod.determinism_violation" => (
+                FaultCategory::Determinism,
+                FaultPhase::Execution,
+                SeverityGrade::L4Runtime,
+                Disposition::Rebuild,
+                true,
+                false,
+                RecoveryAdvice::RebuildInstance,
+            ),
+            "platform.mod.migration_failed" => (
+                FaultCategory::Migration,
+                FaultPhase::Teardown,
+                SeverityGrade::L4Runtime,
+                Disposition::Rebuild,
+                true,
+                false,
+                RecoveryAdvice::RestoreCheckpoint,
+            ),
+            c if c.starts_with("platform.lifecycle") => (
+                FaultCategory::Lifecycle,
+                FaultPhase::Registration,
+                SeverityGrade::L3Mod,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            "platform.mod.runtime_setup" => (
+                FaultCategory::Load,
+                FaultPhase::Instantiation,
+                SeverityGrade::L2Task,
+                Disposition::Stop,
+                false,
+                false,
+                RecoveryAdvice::DisableMod,
+            ),
+            // Conservative default (§5.3 row 8): never default to continue.
+            _ => (
+                FaultCategory::WasmTrap,
+                FaultPhase::Execution,
+                SeverityGrade::L4Runtime,
+                Disposition::Rebuild,
+                true,
+                false,
+                RecoveryAdvice::RebuildInstance,
+            ),
+        };
+    FaultDecision {
+        category,
+        phase,
+        severity_grade,
+        disposition,
+        authoritative,
+        retryable,
+        recovery_advice,
+    }
+}
+
+/// Classifies a Wasmtime error raised at instantiation time.
+///
+/// The instantiation-phase linear-memory limit is surfaced by Wasmtime as a
+/// plain error (not a `Trap` and not `OutOfMemory`), so it is matched on its
+/// stable mechanism rather than its localized message text where possible.
+fn classify_instantiation_error(error: &wasmtime::Error) -> (&'static str, &'static str) {
+    if error.downcast_ref::<wasmtime::OutOfMemory>().is_some() {
+        return (
+            "platform.mod.resource.memory_limit_exceeded",
+            "instantiation exceeded a configured Wasm resource limit",
+        );
+    }
+    if let Some(trap) = error.downcast_ref::<Trap>() {
+        let code = classify_runtime_trap(trap);
+        return (code, "instantiation trapped");
+    }
+    let text = error.to_string();
+    if text.contains("exceeds memory limits") {
+        return (
+            "platform.mod.resource.memory_limit_exceeded",
+            "module linear memory exceeds the configured memory limit",
+        );
+    }
+    if text.contains("exceeds the limit") || text.contains("too many") {
+        return (
+            "platform.mod.resource.memory_limit_exceeded",
+            "module exceeds a configured instantiation limit",
+        );
+    }
+    ("platform.mod.load_failed", "module failed to instantiate")
+}
+
+/// Maps a runtime Wasmtime [`Trap`] to a stable code (frozen §3.2/§3.3 tables).
+///
+/// The classification is based on the typed `Trap` variant only; never on the
+/// trap name string or on message text. This is a thin alias over
+/// [`ModFailureCode::from_trap`] so there is a single source of truth.
+pub(crate) fn classify_runtime_trap(trap: &Trap) -> &'static str {
+    ModFailureCode::from_trap(trap).as_str()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -746,6 +1525,17 @@ pub enum PlatformError {
     RuntimeSetup(String),
     #[error("Wasm module for Mod `{mod_id}` is invalid: {message}")]
     WasmModule { mod_id: String, message: String },
+    /// GK-P3-06: a load/instantiation-phase failure carrying a frozen stable
+    /// code (e.g. `platform.mod.resource.memory_limit_exceeded` for an
+    /// instantiation-phase linear-memory limit, or `platform.mod.load_failed`).
+    ///
+    /// `code` is the machine protocol field; `message` is human-readable only.
+    #[error("Mod `{mod_id}` failed to load ({code}): {message}")]
+    ModLoad {
+        mod_id: String,
+        code: &'static str,
+        message: String,
+    },
     #[error("Mod `{mod_id}` imports `{api_id}` with signature `{found}`, expected `{expected}`")]
     ApiSignatureMismatch {
         mod_id: String,
@@ -775,6 +1565,8 @@ pub enum PlatformErrorCode {
     DependencyResolution,
     RuntimeSetup,
     WasmModule,
+    /// GK-P3-06: load/instantiation failure with a precise frozen code.
+    ModLoad,
     ApiSignatureMismatch,
     Serialization,
     InvalidSchema,
@@ -794,6 +1586,7 @@ impl PlatformErrorCode {
             Self::DependencyResolution => "platform.dependency_resolution",
             Self::RuntimeSetup => "platform.runtime_setup",
             Self::WasmModule => "platform.wasm_module",
+            Self::ModLoad => "platform.mod.load",
             Self::ApiSignatureMismatch => "platform.api_signature_mismatch",
             Self::Serialization => "platform.serialization",
             Self::InvalidSchema => "platform.invalid_schema",
@@ -840,12 +1633,25 @@ impl PlatformError {
             Self::DependencyResolution(_) => PlatformErrorCode::DependencyResolution,
             Self::RuntimeSetup(_) => PlatformErrorCode::RuntimeSetup,
             Self::WasmModule { .. } => PlatformErrorCode::WasmModule,
+            Self::ModLoad { .. } => PlatformErrorCode::ModLoad,
             Self::ApiSignatureMismatch { .. } => PlatformErrorCode::ApiSignatureMismatch,
             Self::Serialization(_) => PlatformErrorCode::Serialization,
             Self::InvalidSchema(_) => PlatformErrorCode::InvalidSchema,
             Self::LockFile(_) => PlatformErrorCode::LockFile,
             Self::ApiCatalog(_) => PlatformErrorCode::ApiCatalog,
             Self::Lifecycle(_) => PlatformErrorCode::Lifecycle,
+        }
+    }
+
+    /// The precise frozen fault code for this error, when it carries one.
+    ///
+    /// For [`PlatformError::ModLoad`] this is the fine-grained stable code
+    /// (`platform.mod.resource.memory_limit_exceeded`, `platform.mod.load_failed`,
+    /// ...). For every other variant it is the same value as [`Self::code`].
+    pub const fn fault_code(&self) -> &'static str {
+        match self {
+            Self::ModLoad { code, .. } => code,
+            _ => self.code().as_str(),
         }
     }
 }
@@ -1603,17 +2409,13 @@ impl System for WasmSystem {
             .map_err(|error| self.system_error(tick, ModFailureCode::RuntimeSetup, error))?;
         let instance = linker
             .instantiate(&mut store, &self.module)
-            .map_err(|error| {
-                self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
-            })?;
+            .map_err(|error| self.instantiation_error(tick, &error))?;
         let on_tick = instance
             .get_typed_func::<(), ()>(&mut store, "on_tick")
-            .map_err(|error| {
-                self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
-            })?;
-        on_tick.call(&mut store, ()).map_err(|error| {
-            self.system_error(tick, ModFailureCode::ExecutionFailed, error.to_string())
-        })?;
+            .map_err(|error| self.instantiation_error(tick, &error))?;
+        on_tick
+            .call(&mut store, ())
+            .map_err(|error| self.execution_error(tick, &error))?;
 
         let state = store.data();
         if state.write_violation {
@@ -1644,6 +2446,31 @@ impl WasmSystem {
     ) -> SystemError {
         SystemError::new(&self.id, tick, code.as_str(), message)
             .with_source_digest(self.content_digest.clone())
+    }
+
+    /// Builds the `SystemError` for a failure raised while the Mod's `on_tick`
+    /// is running.
+    ///
+    /// A wasmtime trap is classified by its typed variant into the frozen
+    /// §3.2/§3.3 stable code; an error that is not a trap keeps the
+    /// conservative `platform.mod.execution_failed` fallback. The classification
+    /// never consults the message text.
+    fn execution_error(&self, tick: Tick, error: &wasmtime::Error) -> SystemError {
+        let code = match error.downcast_ref::<Trap>() {
+            Some(trap) => ModFailureCode::from_trap(trap),
+            None => ModFailureCode::ExecutionFailed,
+        };
+        self.system_error(tick, code, error.to_string())
+    }
+
+    /// Builds the `SystemError` for a failure raised while instantiating the
+    /// Mod's store/instance at execution time.
+    ///
+    /// Instantiation-phase limits (frozen §3.3 C.2) are classified separately
+    /// from runtime traps; anything else is `platform.mod.load_failed`.
+    fn instantiation_error(&self, tick: Tick, error: &wasmtime::Error) -> SystemError {
+        let code = ModFailureCode::from_instantiation_code(classify_instantiation_error(error).0);
+        self.system_error(tick, code, error.to_string())
     }
 }
 
@@ -1847,17 +2674,22 @@ fn validate_module(engine: &Engine, module: &Module, mod_id: &str) -> Result<(),
         mod_id: mod_id.to_owned(),
         message,
     })?;
-    let instance =
-        linker
-            .instantiate(&mut store, module)
-            .map_err(|error| PlatformError::WasmModule {
-                mod_id: mod_id.to_owned(),
-                message: error.to_string(),
-            })?;
+    // GK-P3-06: an instantiation-phase failure is classified by mechanism into
+    // its frozen stable code (§3.3 C.2), rather than being folded into the
+    // generic `platform.wasm_module` code.
+    let instance = linker.instantiate(&mut store, module).map_err(|error| {
+        let (code, _) = classify_instantiation_error(&error);
+        PlatformError::ModLoad {
+            mod_id: mod_id.to_owned(),
+            code,
+            message: error.to_string(),
+        }
+    })?;
     instance
         .get_typed_func::<(), ()>(&mut store, "on_tick")
-        .map_err(|error| PlatformError::WasmModule {
+        .map_err(|error| PlatformError::ModLoad {
             mod_id: mod_id.to_owned(),
+            code: "platform.mod.load_failed",
             message: format!("expected export `on_tick: () -> ()`: {error}"),
         })?;
     Ok(())
@@ -1965,6 +2797,33 @@ pub fn validate_api_catalog_value(value: &serde_json::Value) -> Result<(), Strin
     if let Err(error) = validator.validate(value) {
         return Err(format!(
             "api catalog schema violation at `{}`: {error}",
+            error.instance_path()
+        ));
+    }
+    Ok(())
+}
+
+/// The embedded `mod-fault-report-v1` schema, exposed so contract tests can
+/// prove the report's exported bytes satisfy the published schema.
+pub const MOD_FAULT_REPORT_SCHEMA: &str =
+    include_str!("../../../schemas/mod-fault-report-v1.schema.json");
+
+/// Validates a serialized fault-report value against the embedded v1 schema.
+///
+/// The Schema is the frozen structural half of the GK-P3-06 contract; the
+/// category/phase/disposition decision values are additionally fixed by the
+/// report's stable `code` (see [`ModFaultReport::new`]).
+pub fn validate_fault_report_value(value: &serde_json::Value) -> Result<(), String> {
+    static VALIDATOR: OnceLock<Result<jsonschema::Validator, String>> = OnceLock::new();
+    let validator = VALIDATOR.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(MOD_FAULT_REPORT_SCHEMA).map_err(|error| error.to_string())?;
+        jsonschema::validator_for(&schema).map_err(|error| error.to_string())
+    });
+    let validator = validator.as_ref().map_err(|error| error.clone())?;
+    if let Err(error) = validator.validate(value) {
+        return Err(format!(
+            "fault report schema violation at `{}`: {error}",
             error.instance_path()
         ));
     }
@@ -2523,6 +3382,7 @@ mod tests {
 
     #[test]
     fn mod_failure_codes_are_stable_and_namespaced() {
+        // The four pre-GK-P3-06 codes are preserved unchanged.
         assert_eq!(
             ModFailureCode::RuntimeSetup.as_str(),
             "platform.mod.runtime_setup"
@@ -2538,6 +3398,129 @@ mod tests {
         assert_eq!(
             ModFailureCode::InvalidWorldState.as_str(),
             "platform.mod.invalid_world_state"
+        );
+        // GK-P3-06 refined codes (frozen §3.2/§3.3).
+        assert_eq!(
+            ModFailureCode::FuelExceeded.as_str(),
+            "platform.mod.resource.fuel_exceeded"
+        );
+        assert_eq!(
+            ModFailureCode::MemoryOutOfBounds.as_str(),
+            "platform.mod.resource.memory_out_of_bounds"
+        );
+        assert_eq!(
+            ModFailureCode::StackExceeded.as_str(),
+            "platform.mod.resource.stack_exceeded"
+        );
+        assert_eq!(
+            ModFailureCode::QuotaExceeded.as_str(),
+            "platform.mod.resource.quota_exceeded"
+        );
+        assert_eq!(
+            ModFailureCode::MemoryLimitExceeded.as_str(),
+            "platform.mod.resource.memory_limit_exceeded"
+        );
+        assert_eq!(
+            ModFailureCode::StackLimitExceeded.as_str(),
+            "platform.mod.resource.stack_limit_exceeded"
+        );
+        assert_eq!(
+            ModFailureCode::LoadFailed.as_str(),
+            "platform.mod.load_failed"
+        );
+        assert_eq!(
+            ModFailureCode::InitializationFailed.as_str(),
+            "platform.mod.initialization_failed"
+        );
+        assert_eq!(
+            ModFailureCode::ApiInvocationFailed.as_str(),
+            "platform.mod.api.invocation_failed"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapUnreachable.as_str(),
+            "platform.mod.guest_trap.unreachable"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapIntegerOverflow.as_str(),
+            "platform.mod.guest_trap.integer_overflow"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapIntegerDivideByZero.as_str(),
+            "platform.mod.guest_trap.integer_divide_by_zero"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapInvalidConversion.as_str(),
+            "platform.mod.guest_trap.invalid_conversion"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapInterrupted.as_str(),
+            "platform.mod.guest_trap.interrupted"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapOther.as_str(),
+            "platform.mod.guest_trap.other"
+        );
+        assert_eq!(
+            ModFailureCode::GuestTrapUnknown.as_str(),
+            "platform.mod.guest_trap.unknown"
+        );
+    }
+
+    #[test]
+    fn trap_variants_map_to_frozen_stable_codes() {
+        assert_eq!(
+            classify_runtime_trap(&Trap::OutOfFuel),
+            "platform.mod.resource.fuel_exceeded"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::MemoryOutOfBounds),
+            "platform.mod.resource.memory_out_of_bounds"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::StackOverflow),
+            "platform.mod.resource.stack_exceeded"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::UnreachableCodeReached),
+            "platform.mod.guest_trap.unreachable"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::IntegerOverflow),
+            "platform.mod.guest_trap.integer_overflow"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::IntegerDivisionByZero),
+            "platform.mod.guest_trap.integer_divide_by_zero"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::BadConversionToInteger),
+            "platform.mod.guest_trap.invalid_conversion"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::Interrupt),
+            "platform.mod.guest_trap.interrupted"
+        );
+        // The "other" group vs the truly-unknown group (frozen §3.2).
+        assert_eq!(
+            classify_runtime_trap(&Trap::TableOutOfBounds),
+            "platform.mod.guest_trap.other"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::IndirectCallToNull),
+            "platform.mod.guest_trap.other"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::BadSignature),
+            "platform.mod.guest_trap.other"
+        );
+        assert_eq!(
+            classify_runtime_trap(&Trap::NullReference),
+            "platform.mod.guest_trap.other"
+        );
+        // A GC/component variant not in the "other" list must fall through to unknown.
+        assert_eq!(
+            classify_runtime_trap(&Trap::HeapMisaligned),
+            "platform.mod.guest_trap.unknown"
         );
     }
 
@@ -3126,7 +4109,19 @@ mod tests {
         .unwrap();
         let grants = BTreeSet::from(["world.read".to_owned(), "world.command".to_owned()]);
         let engine = create_wasm_engine().unwrap();
-        let result = LoadedWasmMod::compile(&package, &grants, &engine);
-        assert!(matches!(result, Err(PlatformError::WasmModule { .. })));
+        let error = match LoadedWasmMod::compile(&package, &grants, &engine) {
+            Ok(_) => panic!("over-limit memory must be rejected before registration"),
+            Err(error) => error,
+        };
+        // GK-P3-06: the instantiation-phase linear-memory limit reports its
+        // frozen §3.3 C.2 code, distinct from the runtime OOB code.
+        assert_eq!(
+            error.fault_code(),
+            "platform.mod.resource.memory_limit_exceeded"
+        );
+        let report = ModFaultReport::from_platform_error(&error);
+        assert_eq!(report.category, FaultCategory::ResourceLimit);
+        assert_eq!(report.phase, FaultPhase::Instantiation);
+        assert_eq!(report.disposition, Disposition::Stop);
     }
 }

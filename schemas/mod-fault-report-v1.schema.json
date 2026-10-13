@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/mod-fault-report-v1.schema.json",
+  "title": "Game Kernel Mod Fault Report v1",
+  "description": "Structural schema for the unified Platform fault report (GK-P3-06), frozen as design rev2. Covers all 14 error categories of Mod Platform Specification v1.0 section 12.1. Unknown-field policy: v1 rejects unknown fields (additionalProperties:false); any field-set change MUST bump report_version. `message` is human-readable and MUST NOT be used as a machine protocol field. NOTE: the `determinism` and `migration` categories are placeholders; their detection capability is NOT implemented (unmet items O-6-1 / O-6-2).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_version",
+    "code",
+    "category",
+    "phase",
+    "severity_grade",
+    "disposition",
+    "authoritative",
+    "retryable",
+    "recovery_advice",
+    "message"
+  ],
+  "properties": {
+    "report_version": { "const": 1 },
+    "code": { "type": "string", "minLength": 3, "maxLength": 200, "pattern": "^[a-z][a-z0-9_.]*$" },
+    "category": { "$ref": "#/$defs/category" },
+    "phase": { "$ref": "#/$defs/phase" },
+    "severity_grade": { "$ref": "#/$defs/severity_grade" },
+    "disposition": { "$ref": "#/$defs/disposition" },
+    "authoritative": { "type": "boolean" },
+    "retryable": { "type": "boolean" },
+    "recovery_advice": { "$ref": "#/$defs/recovery_advice" },
+
+    "mod_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "mod_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "manifest_version": { "type": "integer", "minimum": 1 },
+    "kernel_api_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "platform_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "load_plan_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "instance_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "content_digest": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "tick": { "type": "integer", "minimum": 0 },
+    "scheduler_context": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "api_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "system_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+
+    "resource": { "$ref": "#/$defs/resource_use" },
+    "dependency_context": { "$ref": "#/$defs/dependency_context" },
+    "rollback": { "$ref": "#/$defs/rollback_outcome" },
+
+    "message": { "type": "string", "maxLength": 4096 }
+  },
+  "$defs": {
+    "category": {
+      "description": "The 14 error categories of Mod Platform Specification v1.0 section 12.1.",
+      "enum": [
+        "manifest",
+        "package",
+        "dependency",
+        "version_conflict",
+        "permission",
+        "load",
+        "initialization",
+        "api_registration",
+        "api_invocation",
+        "wasm_trap",
+        "resource_limit",
+        "determinism",
+        "lifecycle",
+        "migration"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "discovery", "manifest", "package", "resolution", "lockfile",
+        "permission", "compile", "instantiation", "registration",
+        "initialization", "execution", "teardown"
+      ]
+    },
+    "severity_grade": { "enum": ["l1_call", "l2_task", "l3_mod", "l4_runtime"] },
+    "disposition": { "enum": ["continue", "stop", "rebuild"] },
+    "recovery_advice": {
+      "enum": [
+        "none", "retry_call", "disable_mod", "rebuild_instance",
+        "restore_checkpoint", "fix_manifest", "fix_package"
+      ]
+    },
+    "limit_kind": {
+      "description": "Resource budget kinds (Mod Platform Specification section 10.1). Current default values are configurable and NOT a frozen contract.",
+      "enum": [
+        "fuel_per_call", "per_tick_fuel", "memory", "commands_per_tick",
+        "events_per_tick", "tasks", "api_calls", "persistent_bytes", "log_bytes"
+      ]
+    },
+    "resource_use": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit_kind", "exceeded"],
+      "properties": {
+        "limit_kind": { "$ref": "#/$defs/limit_kind" },
+        "limit_value": { "type": "integer", "minimum": 0 },
+        "observed_value": { "type": "integer", "minimum": 0 },
+        "config_version": { "type": "integer", "minimum": 1 },
+        "exceeded": { "type": "boolean" }
+      }
+    },
+    "dependency_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dependency_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "required": { "type": "boolean" },
+        "cycle": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "affected_consumers": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        }
+      }
+    },
+    "rollback_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executed"],
+      "properties": {
+        "executed": { "type": "boolean" },
+        "succeeded": { "type": "boolean" },
+        "discarded_work": { "type": "boolean" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "Cross-field rule: a rebuild disposition can only advise rebuild_instance or restore_checkpoint.",
+      "if": { "properties": { "disposition": { "const": "rebuild" } }, "required": ["disposition"] },
+      "then": { "properties": { "recovery_advice": { "enum": ["rebuild_instance", "restore_checkpoint"] } } }
+    },
+    {
+      "description": "Cross-field rule: fix_manifest advice requires a Mod identity.",
+      "if": { "properties": { "recovery_advice": { "const": "fix_manifest" } }, "required": ["recovery_advice"] },
+      "then": { "properties": { "mod_id": { "type": "string" } }, "required": ["mod_id"] }
+    },
+    {
+      "description": "Cross-field rule: the wasm_trap category requires an execution phase.",
+      "if": { "properties": { "category": { "const": "wasm_trap" } }, "required": ["category"] },
+      "then": { "properties": { "phase": { "const": "execution" } } }
+    }
+  ]
+}

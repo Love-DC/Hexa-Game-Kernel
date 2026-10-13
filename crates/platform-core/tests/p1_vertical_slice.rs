@@ -96,7 +96,9 @@ fn wasm_trap_rolls_back_external_commands_and_requires_reconstruction() {
         other => panic!("expected stable Mod failure, got {other:?}"),
     };
     assert_eq!(failure.format_version, 1);
-    assert_eq!(failure.code, "platform.mod.execution_failed");
+    // GK-P3-06: runtime fuel exhaustion now reports its frozen stable code
+    // (frozen design §3.3 C.1) instead of the blanket `platform.mod.execution_failed`.
+    assert_eq!(failure.code, "platform.mod.resource.fuel_exceeded");
     assert_eq!(failure.system, "org.game.fuel-loop");
     assert_eq!(failure.tick, Tick(0));
     assert_eq!(
@@ -105,7 +107,7 @@ fn wasm_trap_rolls_back_external_commands_and_requires_reconstruction() {
     );
     let report = serde_json::to_value(&failure).unwrap();
     assert_eq!(report["format_version"], 1);
-    assert_eq!(report["code"], "platform.mod.execution_failed");
+    assert_eq!(report["code"], "platform.mod.resource.fuel_exceeded");
     assert_eq!(report["tick"], 0);
     assert_eq!(kernel.world().tick(), Tick(0));
     assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
