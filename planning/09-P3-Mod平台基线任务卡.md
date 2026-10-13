@@ -2,9 +2,9 @@
 
 - 阶段：P3
 - 状态：P3 执行中；GK-P3-01 已通过本地与 Gitee Go 验收，GK-P3-02 已通过本地门禁与远端 Gitee Go 验收（构建 #11/#13，2026-10-14 确认）
-- 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
+- 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`Mod Platform Specification v1.0.md`；`Kernel Contract v1.0.md`；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
 - 当前代码基线：`crates/platform-core` 包含严格 JSON Manifest 解析、本地目录发现、必需依赖 SemVer 校验、确定性拓扑解析、内存 LoadPlan、宿主权限授权和 Wasmtime 适配；目前仅有 `gk::counter_read` / `gk::counter_set` 两个 Host API。
-- 规范边界：仓库内独立的 `Mod Platform Specification v1.0.md` 是空文件；本卡以完整项目规范为依据。不得静默填充空文件或将未决字段假装成既有契约。
+- 规范边界：`Mod Platform Specification v1.0.md` 现已作为 P3 的领域规范基线。本卡定义本阶段实际实现的子集；规范中尚未实现的可选依赖、Provider/多候选策略、完整 API Registry、扩展生命周期和运行时资源管理属于后续 P3 工作包或后续阶段，不能仅凭规范存在就标记为已实现。发现与已验收 Kernel 契约冲突时，先登记并对齐再实现。
 
 ## 目标与范围
 
@@ -14,7 +14,7 @@
 
 - 保持当前 `manifest_version = 1` 的既有字段与含义：`manifest_version`、`id`、`version`、`kernel_api`、`entrypoint`、`requested_permissions`、`dependencies`。为这份实际支持的子集发布正式 JSON Schema；不把完整项目规范建议字段说成已实现字段。
 - 未知 Manifest 字段继续拒绝。新字段或语义变更须提升 Manifest 版本并提供兼容决定；不因补 Schema 改变现有示例包。
-- P3 初版依赖只支持必需的本地直接 Mod 依赖和 SemVer 约束；缺失、重复、冲突、版本不符或循环均拒绝整份加载计划。可选依赖、Mod 间公开 API 依赖与 Game Definition 约束先写清规则后再接入。
+- P3 当前实现只支持必需的本地直接 Mod 依赖和 SemVer 约束；缺失、重复、冲突、版本不符或循环均拒绝整份加载计划。可选依赖虽已在领域规范定义，但当前实现不支持；Mod 间公开 API 依赖和 Game Definition 约束也不纳入当前 Resolver。
 - 权限按 deny-by-default 处理：Manifest 申请不等于授权，未经宿主授予不注册；P3 先登记现有 Host API 的版本、输入输出、调用阶段、确定性和权限，不扩大权限。
 - 运行时生命周期不支持热重载、权限热撤销、WASI、文件/网络/进程访问或进程内原生 Mod；故障后重建 Kernel/Platform 实例。
 - 锁文件作为正式复现输入；校验实际包摘要和运行时标识，不静默改写用户选择的组合。
@@ -32,7 +32,7 @@
 
 - **范围：** `resolve_load_plan`、依赖模型、Resolver 契约测试。
 - **实施：** 冻结候选包输入、重复 Mod ID、版本约束、依赖拓扑排序和冲突处理；所有可选输入排列都产生相同有序计划；未满足必需依赖时整计划失败。
-- **测试：** 多个可用版本、重复/缺失依赖、版本不匹配、环、自依赖、输入顺序置换及重复运行。
+- **测试：** 同 ID 多候选明确拒绝；重复/缺失依赖、版本不匹配、环、自依赖、候选输入顺序置换及重复运行。
 - **验收：** 错误含稳定 PlatformErrorCode 与关联 Mod/依赖标识；Launcher 候选选择不会被 Platform 静默改变。
 - **边界：** 现阶段只有一个同 ID 包可用，因此不猜测多版本 side-by-side；如 P3 要支持多版本，先冻结身份/隔离语义。
 
@@ -106,3 +106,23 @@ P3 只有在 P3-01 至 P3-07 的契约和验收逐项通过后才完成。仅有
 - **本地门禁：** `cargo fmt --all -- --check`、`cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo test --locked --workspace`（Platform 单元 23 项、集成 `p1_vertical_slice` 3 项、集成 `resolver_contract` 3 项、Kernel 14 项，全部通过）、`cargo run --locked -p game-platform -- demo`（`verified=true`）均通过。
 - **远端门禁（2026-10-14 证据更新，P3-10 文档维护）：** **已确认通过**。最终增量提交 `6e7c7cf`（`Structure dependency resolution failures`，2026-10-13 09:35:18 推送）对应 Gitee Go 构建 **#13**（流水线 `game-kernel-rust-ci`，分支 `main`，Webhook 触发），于 **2026-10-13 09:35:30 (+08:00) 成功**，用户已明确确认。前置增量 `a872a1c` 此前已由构建 **#11** 确认成功（见 GK-P3-01 远端验收）。~~**远端门禁：** 尚未确认。需用户确认本次提交的 Gitee Go 构建。~~（2026-10-13 撰写时的历史记录，已被构建 #13 证据取代。）
 - **未决边界：** 多版本 side-by-side、可选依赖、Mod 间公开 API 依赖和 Provider 选择仍不支持；`DependencyResolutionFailure` 的持久报告 Schema 属 GK-P3-06。
+
+### 新规范对齐说明
+
+- **状态：** `Mod Platform Specification v1.0.md` 已加入仓库，作为目标契约基线；其要求不自动代表当前实现已达标。
+- **当前 P3 子集：** 依次按 GK-P3-01 至 GK-P3-07 验收。尚未进入的完整 Provider 选择、可选依赖、资源目录与运行时热变更能力不得提前纳入本次 Resolver 行为。
+- **依赖关系：** Kernel 命令与 Tick 语义以已验收的 `Kernel Contract v1.0.md` / P2 报告为准；如领域规范内容不一致，先协调文档后再扩展代码。
+
+### GK-P3-04 — API Registry / Catalog 最小目录（本地门禁与远端 Gitee Go 均已通过）
+
+- **状态（2026-10-14 证据更新，GK-P3-20 文档维护）：** 已提交为 `2b3c71a`（`Add host API registry and catalog`）并推送；本地门禁与远端 Gitee Go 均已通过（构建 **#15**，2026-10-14 00:27:49 成功，用户确认；原 P3-04 记录冲突已由 #15 证据关闭，见 `planning/18` §七/§八）。~~本地实现与全部门禁通过；等待用户验收，尚未提交。~~（2026-10-13 撰写时的历史记录）
+- **范围（未扩大）：** 仅登记当前真正实现的 2 个宿主 API；不新增 Host API、不扩展权限面、不改动 Kernel/Contract/Manifest Schema/锁文件格式。
+- **单一事实源：** `crates/platform-core/src/lib.rs` 新增 `HOST_APIS: &[HostApiDescriptor]`，为唯一注册表。`HostApiDescriptor` 记录稳定 ID、Wasm 导入模块/字段、`api_version`、provider、guest 签名（参数/返回值类型）、所需权限、调用阶段、确定性、失败分类与简要说明。`compile()` 的导入校验、`validate_manifest` 的允许权限集合、以及导出的 Catalog 三者均从该注册表派生；`new_linker` 的显式 `func_wrap` 注册由契约测试与注册表逐一比对（见下）。
+- **签名校验：** 新增 `HostApiSignature` / `HostApiValueList`（参数与返回值类型以 `WasmValueKind` 表达）。`compile()` 在注册/执行前比对注册表签名与模块导入的实际 `FuncType`，不符即拒绝（新稳定码 `platform.api_signature_mismatch`）。未知导入仍以 `platform.wasm_module` 拒绝，未申请权限以 `platform.permission_not_requested` 拒绝——均在 Mod 逻辑执行前。
+- **版本校验语义：** `api_version` 不是只导出不验证：`ApiCatalog::verify()` 拒绝不支持的 `catalog_version`（`platform.api_catalog.unknown_version`）与任何非 `HOST_API_VERSION` 的 `api_version`（`platform.api_catalog.unsupported_api_version`）；`validate_registry()` 对源注册表做同样的自洽校验，任何不一致都会使测试失败。
+- **Catalog 导出：** `api_catalog() -> ApiCatalog` + 确定性 `to_bytes()`（pretty JSON + 末尾换行，条目按 API ID 排序）；不自动写盘。新增 Schema `schemas/mod-api-catalog-v1.schema.json`（Draft 2020-12，`additionalProperties:false`，导出字段/排序/签名表达一致）。
+- **错误码：** 优先复用现有码；仅新增必要的最小集合——`platform.api_signature_mismatch`（签名不符需可诊断）与 `platform.api_catalog`（`ApiCatalogFailure` 载荷，装箱）。其余沿用既有码。
+- **测试：** 新增 `crates/platform-core/tests/api_registry_contract.rs` 13 项：Catalog 与**真实 Wasmtime Linker** 注册集合逐一相等（经 `linker_registration_probe()` 枚举 `Linker::iter`，非手工键列表）、签名与真实注册签名一致、未知导入拒绝、签名不符拒绝（`ApiSignatureMismatch`）、未申请权限拒绝（`PermissionNotRequested`）、不支持 catalog/api 版本拒绝、Catalog 权限集合与实际校验一致、排序与序列化字节稳定、导出结果通过 Schema 且 Schema 能拒绝错型输入、Catalog 仅含两个已实现 API、注册表自洽。`lib.rs` 单元新增 4 项。
+- **本地门禁（均实跑通过）：** `cargo fmt --all -- --check`；`cargo clippy --locked --workspace --all-targets -- -D warnings`（退出 0，仅 Windows 增量锁文件环境警告）；`cargo test --locked --workspace`（Platform 单元 29、`api_registry_contract` 13、`lockfile_contract` 17、`p1_vertical_slice` 3、`resolver_contract` 3、Kernel 14，共 79 项 0 失败）；`cargo run --locked -p game-platform -- demo`（`verified=true`）。
+- **未决边界：** 仅覆盖宿主内置 API（provider = `game-platform`）；Mod 提供/消费 API 的注册与关联（§8.2 关联、§8.3 异步与事件）不在本任务；§9.2 中尚未实现的权限类别不得出现在 Catalog。
+- **远端门禁：** **已通过**——构建 **#15**（流水线 `game-kernel-rust-ci`，分支 `main`）对应 `2b3c71a`，2026-10-14 00:27:49 (+08:00) 成功（用户经 Web 控制台确认）。~~尚未推送，未验证。~~
