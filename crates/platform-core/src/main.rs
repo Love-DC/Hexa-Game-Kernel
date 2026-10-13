@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 
-use game_platform::{LoadedWasmMod, create_wasm_engine, discover_mods, resolve_load_plan};
+use game_platform::{
+    LoadedWasmMod, ModRegistry, create_wasm_engine, discover_mods, resolve_load_plan,
+};
 use kernel_core::{ComponentValue, Kernel, StepInput, World, WorldId};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -26,7 +28,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut world = World::new(WorldId(1));
     world.seed_resource("org.game/counter", ComponentValue::Integer(0))?;
     let mut kernel = Kernel::new(world)?;
-    kernel.register_system(Box::new(loaded.system()))?;
+    // Production code registers Systems only through the coordinator, so the
+    // recorded ID set stays a faithful mirror of what the Kernel accepted.
+    let mut registry = ModRegistry::new();
+    registry.register_batch(
+        &mut kernel,
+        vec![(package.manifest.id.clone(), Box::new(loaded.system()))],
+    )?;
 
     for _ in 0..3 {
         let output = kernel.step(StepInput::default())?;
@@ -51,7 +59,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         final_hash.ok_or("continuation did not advance")?
     };
     let mut restored = Kernel::from_snapshot(&snapshot)?;
-    restored.register_system(Box::new(loaded.system()))?;
+    let mut restored_registry = ModRegistry::new();
+    restored_registry.register_batch(
+        &mut restored,
+        vec![(package.manifest.id.clone(), Box::new(loaded.system()))],
+    )?;
     let mut actual = None;
     for _ in 0..3 {
         actual = Some(restored.step(StepInput::default())?.state_hash);

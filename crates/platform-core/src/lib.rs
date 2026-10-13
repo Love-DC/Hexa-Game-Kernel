@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use kernel_core::{Command, ComponentValue, System, SystemError, Tick, World};
+use kernel_core::{Command, ComponentValue, Kernel, System, SystemError, Tick, World};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -761,6 +761,8 @@ pub enum PlatformError {
     LockFile(Box<LockFileFailure>),
     #[error("API catalog failure: {0}")]
     ApiCatalog(Box<ApiCatalogFailure>),
+    #[error("Mod lifecycle or registration failure: {0}")]
+    Lifecycle(Box<LifecycleFailure>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -778,6 +780,7 @@ pub enum PlatformErrorCode {
     InvalidSchema,
     LockFile,
     ApiCatalog,
+    Lifecycle,
 }
 
 impl PlatformErrorCode {
@@ -796,6 +799,7 @@ impl PlatformErrorCode {
             Self::InvalidSchema => "platform.invalid_schema",
             Self::LockFile => "platform.lock_file",
             Self::ApiCatalog => "platform.api_catalog",
+            Self::Lifecycle => "platform.lifecycle",
         }
     }
 }
@@ -820,6 +824,12 @@ impl PlatformError {
         Self::ApiCatalog(Box::new(failure))
     }
 
+    /// Builds a lifecycle/registration failure with the same boxing rationale
+    /// as [`PlatformError::dependency`].
+    fn lifecycle(failure: LifecycleFailure) -> Self {
+        Self::Lifecycle(Box::new(failure))
+    }
+
     pub const fn code(&self) -> PlatformErrorCode {
         match self {
             Self::Io { .. } => PlatformErrorCode::Io,
@@ -835,6 +845,7 @@ impl PlatformError {
             Self::InvalidSchema(_) => PlatformErrorCode::InvalidSchema,
             Self::LockFile(_) => PlatformErrorCode::LockFile,
             Self::ApiCatalog(_) => PlatformErrorCode::ApiCatalog,
+            Self::Lifecycle(_) => PlatformErrorCode::Lifecycle,
         }
     }
 }
@@ -2042,6 +2053,467 @@ fn io_error(path: &Path, error: std::io::Error) -> PlatformError {
     PlatformError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mod lifecycle state machine (§7.1 of `Mod Platform Specification v1.0`)
+// ---------------------------------------------------------------------------
+
+/// Observable lifecycle state of a single Mod, as enumerated by
+/// `Mod Platform Specification v1.0` §7.1.
+///
+/// The ten states are exactly the spec set. `Disabled` is deliberately **not**
+/// a variant: the spec describes it as wanting new work but not equal to
+/// `Stopped`, and §7.1 gives no transitions for it. Modelling it here would be
+/// inventing semantics the spec does not define, so it is left as a
+/// to-be-defined item rather than folded into `Stopped`.
+///
+/// # Hot reload / unload is not supported
+///
+/// This build does **not** implement runtime hot reload or re-load of a Mod.
+/// `Unloaded` and `Failed` are conservative terminal states in this
+/// implementation (see [`ModLifecycleState::can_transition_to`]), so there is no
+/// modeled path back from them into the lifecycle; a Mod cannot be re-activated
+/// in place. Recovery is expected to rebuild from a trusted snapshot rather than
+/// to reload a running instance. This statement adds **no** new transition
+/// rules and does not define `Disabled`, `Failed` or `Unloaded` semantics beyond
+/// what §7.1 and the existing transition table already say.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ModLifecycleState {
+    /// Package discovered and its origin recorded.
+    Discovered,
+    /// Manifest, files and compatibility resolved and validated.
+    Validated,
+    /// Dependencies and load order confirmed.
+    Resolved,
+    /// Execution instance created, module code loaded.
+    Loaded,
+    /// Interfaces registered, initial runtime resources created.
+    Initialized,
+    /// Normal scheduling, events and API calls accepted.
+    Active,
+    /// New work refused, permitted cleanup in progress.
+    Stopping,
+    /// No longer accepting runtime work.
+    Stopped,
+    /// Execution instance and managed resources released.
+    Unloaded,
+    /// Error state reachable from multiple stages; records stage and reason.
+    Failed,
+}
+
+impl ModLifecycleState {
+    /// Stable machine-readable name, matching the spec's spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovered => "Discovered",
+            Self::Validated => "Validated",
+            Self::Resolved => "Resolved",
+            Self::Loaded => "Loaded",
+            Self::Initialized => "Initialized",
+            Self::Active => "Active",
+            Self::Stopping => "Stopping",
+            Self::Stopped => "Stopped",
+            Self::Unloaded => "Unloaded",
+            Self::Failed => "Failed",
+        }
+    }
+
+    /// Whether a transition into `next` is permitted by this implementation.
+    ///
+    /// The forward chain is `Discovered -> Validated -> Resolved -> Loaded ->
+    /// Initialized -> Active -> Stopping -> Stopped`, with `Unloaded` reachable
+    /// only from `Stopped`, and `Failed` reachable from any non-terminal stage
+    /// (`Failed` itself never has to terminate the chain, matching "reachable
+    /// from multiple stages").
+    ///
+    /// **Current-implementation strategy, not spec-mandated terminality:**
+    /// §7.1 does not state whether `Unloaded` or `Failed` have outgoing
+    /// transitions. This build takes the conservative position that both are
+    /// terminal and rejects any outgoing transition. This is recorded as a spec
+    /// gap; it must not be read as the spec declaring them terminal.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        match self {
+            Self::Discovered => matches!(next, Self::Validated | Self::Failed),
+            Self::Validated => matches!(next, Self::Resolved | Self::Failed),
+            Self::Resolved => matches!(next, Self::Loaded | Self::Failed),
+            Self::Loaded => matches!(next, Self::Initialized | Self::Failed),
+            Self::Initialized => matches!(next, Self::Active | Self::Failed),
+            Self::Active => matches!(next, Self::Stopping | Self::Failed),
+            Self::Stopping => matches!(next, Self::Stopped | Self::Failed),
+            Self::Stopped => matches!(next, Self::Unloaded | Self::Failed),
+            // Conservative terminal handling; see the doc comment above.
+            Self::Unloaded | Self::Failed => false,
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Unloaded | Self::Failed)
+    }
+}
+
+/// Stable classification for lifecycle and registration failures. Diagnostics
+/// are human-readable and may change; machines must match on these codes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum LifecycleCode {
+    /// A transition not permitted from the current state was requested.
+    #[serde(rename = "platform.lifecycle.illegal_transition")]
+    IllegalTransition,
+    /// Two Systems in one batch declared the same Mod ID.
+    #[serde(rename = "platform.lifecycle.duplicate_mod_id")]
+    DuplicateModId,
+    /// A Mod ID already recorded as registered was submitted again.
+    #[serde(rename = "platform.lifecycle.already_registered")]
+    AlreadyRegistered,
+    /// A Mod ID failed Kernel's own `validate_type_id` rule.
+    #[serde(rename = "platform.lifecycle.invalid_mod_id")]
+    InvalidModId,
+    /// The caller-supplied Mod ID did not equal `System::id()`.
+    #[serde(rename = "platform.lifecycle.mod_id_mismatch")]
+    ModIdMismatch,
+    /// Kernel rejected the registration during the real registration call.
+    #[serde(rename = "platform.lifecycle.registration_rejected")]
+    RegistrationRejected,
+}
+
+impl LifecycleCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IllegalTransition => "platform.lifecycle.illegal_transition",
+            Self::DuplicateModId => "platform.lifecycle.duplicate_mod_id",
+            Self::AlreadyRegistered => "platform.lifecycle.already_registered",
+            Self::InvalidModId => "platform.lifecycle.invalid_mod_id",
+            Self::ModIdMismatch => "platform.lifecycle.mod_id_mismatch",
+            Self::RegistrationRejected => "platform.lifecycle.registration_rejected",
+        }
+    }
+}
+
+/// Structured lifecycle / registration failure. Carries a stable code, the
+/// phase at which a batch failed, and the Mod ID the failure refers to;
+/// `message` is diagnostic text and is not part of the machine protocol.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LifecycleFailure {
+    pub code: LifecycleCode,
+    /// Mod whose transition or registration failed, when one is identifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<String>,
+    /// State the Mod was in when the transition was rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<ModLifecycleState>,
+    /// State the transition attempted to reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<ModLifecycleState>,
+    /// Zero-based index of the batch element that failed, when a batch failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<usize>,
+    /// Human-readable diagnostic. Not part of the machine protocol.
+    pub message: String,
+}
+
+impl LifecycleFailure {
+    fn new(code: LifecycleCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            mod_id: None,
+            from: None,
+            to: None,
+            batch_index: None,
+            message: message.into(),
+        }
+    }
+
+    fn with_mod(mut self, mod_id: impl Into<String>) -> Self {
+        self.mod_id = Some(mod_id.into());
+        self
+    }
+
+    fn with_transition(mut self, from: ModLifecycleState, to: ModLifecycleState) -> Self {
+        self.from = Some(from);
+        self.to = Some(to);
+        self
+    }
+
+    fn with_batch_index(mut self, index: usize) -> Self {
+        self.batch_index = Some(index);
+        self
+    }
+
+    /// Stable machine-readable code.
+    pub const fn code(&self) -> LifecycleCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for LifecycleFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Per-Mod lifecycle tracker. Owns one Mod's current state and validates every
+/// transition against [`ModLifecycleState::can_transition_to`].
+///
+/// This type deliberately owns **only** lifecycle state. The set of
+/// successfully registered System IDs is owned by [`ModRegistry`]; the two
+/// responsibilities are kept apart so lifecycle bookkeeping can never silently
+/// stand in for registration truth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModLifecycle {
+    mod_id: String,
+    state: ModLifecycleState,
+    /// History of accepted transitions, oldest first, for diagnostics.
+    history: Vec<ModLifecycleState>,
+}
+
+impl ModLifecycle {
+    /// Starts a Mod at `Discovered`, the entry state of §7.1.
+    pub fn discovered(mod_id: impl Into<String>) -> Self {
+        let mod_id = mod_id.into();
+        Self {
+            history: vec![ModLifecycleState::Discovered],
+            mod_id,
+            state: ModLifecycleState::Discovered,
+        }
+    }
+
+    pub fn mod_id(&self) -> &str {
+        &self.mod_id
+    }
+
+    pub fn state(&self) -> ModLifecycleState {
+        self.state
+    }
+
+    pub fn history(&self) -> &[ModLifecycleState] {
+        &self.history
+    }
+
+    /// Attempts to advance to `next`. Illegal transitions are rejected with a
+    /// diagnosable [`LifecycleFailure`] and leave the current state unchanged.
+    pub fn transition(&mut self, next: ModLifecycleState) -> Result<(), PlatformError> {
+        if !self.state.can_transition_to(next) {
+            return Err(PlatformError::lifecycle(
+                LifecycleFailure::new(
+                    LifecycleCode::IllegalTransition,
+                    format!(
+                        "illegal lifecycle transition for Mod `{}`: {} -> {}",
+                        self.mod_id,
+                        self.state.as_str(),
+                        next.as_str()
+                    ),
+                )
+                .with_mod(self.mod_id.clone())
+                .with_transition(self.state, next),
+            ));
+        }
+        self.state = next;
+        self.history.push(next);
+        Ok(())
+    }
+
+    /// Marks the Mod failed, recording the failure stage. Legal from every
+    /// non-terminal stage; a Mod already terminal is rejected.
+    pub fn fail(&mut self) -> Result<(), PlatformError> {
+        self.transition(ModLifecycleState::Failed)
+    }
+}
+
+/// Registration coordinator. Owns the set of Mod IDs whose Systems have been
+/// **successfully** registered with a `Kernel`, and routes batch registration
+/// through a single pre-validated entry point.
+///
+/// # Consistency boundary
+///
+/// This coordinator constrains registrations that flow through it. It can
+/// **neither discover nor prevent** a caller that invokes
+/// `Kernel::register_system` directly: the Kernel exposes that method to
+/// everyone, and a direct call will not update this record. Any statement about
+/// "global registration consistency" is therefore false by construction.
+///
+/// # What the batch guarantee does and does not cover
+///
+/// For a batch submitted through [`ModRegistry::register_batch`], the effective
+/// registration ID of every element is **frozen during pre-validation** and the
+/// Kernel is handed a wrapper whose `id()` always returns that frozen value
+/// (see [`FrozenIdSystem`]). Consequently:
+///
+/// - An unstable `System::id()` can no longer make the Kernel reject a later
+///   element after eager elements were already committed. The `id()`-drift
+///   class of partial commit is closed.
+/// - For a Kernel that holds **only** coordinator-registered Systems, every
+///   pre-validation failure mode is decided before any Kernel mutation, so the
+///   batch is all-or-nothing.
+/// - It is **not** an unconditional atomicity claim. If the target Kernel
+///   already contains a System registered *outside* this coordinator, the
+///   Kernel may still reject an element mid-batch, leaving earlier elements
+///   committed. That residual case is the pre-existing bypass limitation, not
+///   an `id()`-stability issue, and is exercised by
+///   `bypass_boundary_direct_kernel_registration_does_not_update_the_record`.
+///
+/// This is a constructive guarantee for coordinator-submitted batches. It is
+/// **not** a Kernel-provided transaction or rollback facility.
+#[derive(Clone, Debug, Default)]
+pub struct ModRegistry {
+    registered: BTreeSet<String>,
+}
+
+/// A `System` wrapper that pins the identity the Kernel observes.
+///
+/// The Kernel reads a System's identity by calling `System::id()` — once to
+/// validate, again to scan for duplicates, and again when sorting. A `System`
+/// whose `id()` returns a different value on different calls can therefore pass
+/// pre-validation and still fail (or be recorded under the wrong name) during
+/// registration. Wrapping the System in this adapter makes `id()` return one
+/// frozen string for the entire registration, so the identity that was
+/// pre-validated is exactly the identity the Kernel commits.
+///
+/// `execute` is delegated to the wrapped System unchanged.
+struct FrozenIdSystem {
+    id: String,
+    inner: Box<dyn System>,
+}
+
+impl FrozenIdSystem {
+    fn new(id: String, inner: Box<dyn System>) -> Self {
+        Self { id, inner }
+    }
+}
+
+impl System for FrozenIdSystem {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn execute(&self, world: &World, tick: Tick) -> Result<Vec<Command>, SystemError> {
+        self.inner.execute(world, tick)
+    }
+}
+
+impl ModRegistry {
+    pub fn new() -> Self {
+        Self {
+            registered: BTreeSet::new(),
+        }
+    }
+
+    /// Mod IDs recorded as successfully registered, in stable order.
+    pub fn registered_ids(&self) -> impl Iterator<Item = &str> {
+        self.registered.iter().map(String::as_str)
+    }
+
+    /// Number of Mod IDs recorded as successfully registered.
+    pub fn registered_count(&self) -> usize {
+        self.registered.len()
+    }
+
+    pub fn contains(&self, mod_id: &str) -> bool {
+        self.registered.contains(mod_id)
+    }
+
+    /// Registers a batch of Systems under one pre-validation pass.
+    ///
+    /// The input is consuming and ownership-transferring: each element pairs the
+    /// caller-declared Mod ID with the owned `System`, so the coordinator can
+    /// take the System and hand it to the Kernel without a second borrow.
+    ///
+    /// Each element's identity is read from `System::id()` **exactly once**
+    /// during pre-validation and then frozen. Phase 2 hands the Kernel a
+    /// [`FrozenIdSystem`] carrying that frozen identity, so the ID the Kernel
+    /// validates, de-duplicates and sorts by is always the ID that was
+    /// pre-validated — even if the underlying `System::id()` is not stable
+    /// across calls. This is what removes the `id()`-drift class of partial
+    /// commit.
+    ///
+    /// Pre-validation runs **before any Kernel mutation** and covers, in order:
+    /// 1. the declared Mod ID equalling the System's (single) `id()` read;
+    /// 2. within-batch duplicate Mod IDs;
+    /// 3. Mod IDs already recorded as registered;
+    /// 4. Kernel's own ID rule, reusing `kernel_core::validate_type_id` so this
+    ///    layer never maintains a second, drifting rule set.
+    ///
+    /// Only if every element passes is the batch committed to the Kernel. Each
+    /// Kernel registration is still fallible (see the type-level note on the
+    /// residual bypass case), and a rejection fails the whole batch with
+    /// [`LifecycleCode::RegistrationRejected`]. IDs are written to the record
+    /// **only after** the corresponding `register_system` call returns `Ok`.
+    pub fn register_batch(
+        &mut self,
+        kernel: &mut Kernel,
+        systems: Vec<(String, Box<dyn System>)>,
+    ) -> Result<(), PlatformError> {
+        // Phase 1: pre-validation. No Kernel state is touched here. Each id()
+        // is read exactly once and carried forward as the frozen identity.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut pending: Vec<(String, Box<dyn System>)> = Vec::with_capacity(systems.len());
+        for (index, (declared_id, system)) in systems.into_iter().enumerate() {
+            let actual_id = system.id().to_owned();
+            if declared_id != actual_id {
+                return Err(PlatformError::lifecycle(
+                    LifecycleFailure::new(
+                        LifecycleCode::ModIdMismatch,
+                        format!(
+                            "declared Mod ID `{declared_id}` does not match System::id() `{actual_id}`"
+                        ),
+                    )
+                    .with_mod(declared_id.clone())
+                    .with_batch_index(index),
+                ));
+            }
+            if !seen.insert(actual_id.clone()) {
+                return Err(PlatformError::lifecycle(
+                    LifecycleFailure::new(
+                        LifecycleCode::DuplicateModId,
+                        format!("Mod ID `{actual_id}` appears more than once in the batch"),
+                    )
+                    .with_mod(actual_id.clone())
+                    .with_batch_index(index),
+                ));
+            }
+            if self.registered.contains(&actual_id) {
+                return Err(PlatformError::lifecycle(
+                    LifecycleFailure::new(
+                        LifecycleCode::AlreadyRegistered,
+                        format!("Mod ID `{actual_id}` is already registered"),
+                    )
+                    .with_mod(actual_id.clone())
+                    .with_batch_index(index),
+                ));
+            }
+            if let Err(reason) = kernel_core::validate_type_id(&actual_id) {
+                return Err(PlatformError::lifecycle(
+                    LifecycleFailure::new(
+                        LifecycleCode::InvalidModId,
+                        format!("Mod ID `{actual_id}` is rejected by Kernel: {reason}"),
+                    )
+                    .with_mod(actual_id.clone())
+                    .with_batch_index(index),
+                ));
+            }
+            // Carry the System forward paired with its frozen identity.
+            pending.push((actual_id, system));
+        }
+
+        // Phase 2: real registration with the frozen identity. The Kernel only
+        // ever observes the pre-validated ID because `FrozenIdSystem::id()`
+        // returns it verbatim. Each success is recorded immediately; a Kernel
+        // rejection surfaces as a diagnosable failure.
+        for (index, (frozen_id, system)) in pending.into_iter().enumerate() {
+            let frozen = Box::new(FrozenIdSystem::new(frozen_id.clone(), system));
+            kernel.register_system(frozen).map_err(|error| {
+                PlatformError::lifecycle(
+                    LifecycleFailure::new(
+                        LifecycleCode::RegistrationRejected,
+                        format!("Kernel rejected Mod ID `{frozen_id}`: {error}"),
+                    )
+                    .with_mod(frozen_id.clone())
+                    .with_batch_index(index),
+                )
+            })?;
+            self.registered.insert(frozen_id);
+        }
+        Ok(())
     }
 }
 
