@@ -6,7 +6,7 @@
 - P3 Mod Platform baseline is the current stage; follow `planning/09-P3-Mod平台基线任务卡.md` before changing Platform modules.
 - Current code is a prototype and does not prove the full v1.0 specifications.
 - Read the relevant planning task card before changing a module. Preserve the status distinctions in `planning/06-AI开发与验收流程.md`.
-- `Game Kernel — 完整项目规范 v1.0.md` is the current umbrella specification and is marked as a design baseline. The separate Kernel Contract and Project Architecture files are absent from the current working tree; the separate Mod Platform and Save specification files are empty. Do not treat those empty files as requirements or silently restore/delete spec material. Use the completed P1/P2 reports and current P3 task card to scope implementation; the full specification remains the broader product target.
+- `Game Kernel — 完整项目规范 v1.0.md` is the umbrella specification. Root-level domain specifications refine it; `planning/` task cards define phase scope and acceptance. The accepted Kernel behavior is recorded in `Kernel Contract v1.0.md` and `planning/08-P2-Kernel契约硬化草案.md`. A specification's existence does not mean its full scope is implemented; follow the current task card and report unresolved conflicts before coding.
 
 ## Boundaries
 
@@ -23,3 +23,8 @@
 - Add focused tests for behavior changes, failure paths, ordering, and snapshot/replay behavior.
 - Update schemas, examples, documentation, and tests together when a public format changes.
 - Never claim a command passed unless it was actually run in the current checkout.
+- Clean Rust build caches with `cargo clean`, never through the Windows file manager. Confirm the project root, the Cargo workspace, and the effective build output directory first; if a custom `target-dir` or `CARGO_TARGET_DIR` is set, state the exact cleaning scope. If the target directory cannot be confirmed, stop and report instead of guessing a path.
+- Only clean regenerable build artifacts that are confirmed to belong to this project (for example Cargo's `target` output). Never decide that a file is deletable from its name, extension, or directory name alone. Do not use broad recursive deletion on the project tree.
+- Unless the user explicitly authorizes a specific target, never clean or overwrite: source code, tests, and project configuration; `AGENTS.md`, specifications, design docs, and task records; `.git`, history, branches, and existing uncommitted work; user archives, test samples, imported files, and other persistent data; files outside the project or another project's build artifacts.
+- After cleaning, report the command, working directory, actual scope, and result; confirm source, specs, and Git history are untouched; re-check `git status` for unintended changes; and re-run the affected build or test commands only when further work requires them. Never clean caches unconditionally or periodically just to reduce file count.
+- The build-cache cleanup permission is not a general permanent-delete permission. Stop and ask the user when the target is unclear, may contain user data, or reaches outside the current project.
