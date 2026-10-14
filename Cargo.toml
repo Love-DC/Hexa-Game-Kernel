@@ -2,6 +2,7 @@
 members = [
     "crates/kernel-core",
     "crates/platform-core",
+    "crates/save-manager",
 ]
 resolver = "3"
 

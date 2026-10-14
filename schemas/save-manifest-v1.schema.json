@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/save-manifest-v1.schema.json",
+  "title": "Game Kernel Save Manifest v1",
+  "description": "Structural schema for the save manifest defined by Save & Compatibility Specification v1.0 §3.2/§3.3. SAVE-001 covers the in-memory model, deterministic serialization and validation only: no file I/O, no digest generation, no migration. This schema checks structure, field names, types and format syntax; value-level semantics (non-empty Mod list, duplicate Mod IDs, supported format version, placeholder root_hash, integrity algorithm) are enforced by the Rust layer. The `integrity.root_hash` field is carried, never generated here, and specification placeholder values MUST be rejected (§3.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "save_format_version",
+    "save_id",
+    "created_at",
+    "last_saved_at",
+    "platform_version",
+    "game_definition",
+    "kernel_api_version",
+    "world_schema_version",
+    "logical_tick",
+    "mods",
+    "simulation_config",
+    "integrity"
+  ],
+  "properties": {
+    "save_format_version": { "$ref": "#/$defs/version_string" },
+    "save_id": { "$ref": "#/$defs/save_id" },
+    "created_at": { "$ref": "#/$defs/timestamp" },
+    "last_saved_at": { "$ref": "#/$defs/timestamp" },
+    "platform_version": { "$ref": "#/$defs/semver" },
+    "game_definition": { "$ref": "#/$defs/game_definition" },
+    "kernel_api_version": { "$ref": "#/$defs/version_string" },
+    "world_schema_version": { "$ref": "#/$defs/version_string" },
+    "logical_tick": { "type": "integer", "minimum": 0 },
+    "mods": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/mod_entry" }
+    },
+    "simulation_config": { "type": "object" },
+    "integrity": { "$ref": "#/$defs/integrity" }
+  },
+  "$defs": {
+    "major_minor": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "version_string": { "$ref": "#/$defs/major_minor" },
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "save_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?)*$"
+    },
+    "game_definition": {
+      "type": "object",
+      "description": "Required metadata recording which Game Definition the save was created by (§3.2). This is a metadata field: it is NOT part of the six-member authoritative version set (§3.4).",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "version": { "$ref": "#/$defs/semver" }
+      }
+    },
+    "mod_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "schema_version"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "version": { "$ref": "#/$defs/semver" },
+        "schema_version": { "$ref": "#/$defs/version_string" }
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "root_hash"],
+      "properties": {
+        "algorithm": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "root_hash": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}
