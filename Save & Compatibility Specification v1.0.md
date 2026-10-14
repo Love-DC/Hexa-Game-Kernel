@@ -25,6 +25,8 @@
 
 本文不要求所有未来版本的游戏都能直接读取任意历史存档，但要求系统能够明确判断兼容性，并在无法安全继续时保护原存档。
 
+> **修订记录（2026-10-14，GK-P4-00）：** 依据 P4-00 规范交叉审查裁决（`planning/23`、`planning/24`、`planning/26`），本规范作如下最小修订：§3.2 增补必需元数据 `game_definition` 并为确定性运行配置命名 `simulation_config`；§3.3 示例补相应字段；§3.4 增版本集合权威性与跨规范同义映射说明；§5.4 增机器级/策略级双层分类映射。**存档域版本模型的权威仍为本规范 §3.4。**
+
 ## 1. 核心目标
 
 存档系统必须满足以下目标：
@@ -148,15 +150,18 @@ save/
 - 创建时间。
 - 最近一次成功保存时间。
 - 游戏平台版本。
+- 创建存档时的 Game Definition 标识与版本（`game_definition`：稳定 `id` + `version`）。
 - Kernel API 版本。
 - 当前游戏 Tick 或等价的逻辑时间。
 - 世界数据 Schema 版本。
 - 创建存档时的 Mod 清单。
 - 每个 Mod 的 ID、版本和数据 Schema 版本。
-- 与确定性恢复相关的运行配置。
+- 与确定性恢复相关的运行配置（`simulation_config`）。
 - 完整性校验信息。
 
 如果联机或重放需要额外元数据，由对应规范补充。
+
+`game_definition` 与 `simulation_config` 均为**必需元数据**；二者缺失时 MUST 拒绝该存档，不得以默认值静默替代。
 
 时间戳只用于识别和管理存档，不得代替逻辑 Tick 决定游戏状态。
 
@@ -169,6 +174,10 @@ save/
   "created_at": "2026-01-01T12:00:00Z",
   "last_saved_at": "2026-01-01T12:30:00Z",
   "platform_version": "1.0.0",
+  "game_definition": {
+    "id": "org.example.base-game",
+    "version": "1.0.0"
+  },
   "kernel_api_version": "1.0",
   "world_schema_version": "1.0",
   "logical_tick": 72000,
@@ -184,6 +193,7 @@ save/
       "schema_version": "2.0"
     }
   ],
+  "simulation_config": {},
   "integrity": {
     "algorithm": "sha256",
     "root_hash": "IMPLEMENTATION_GENERATED"
@@ -203,6 +213,8 @@ save/
 - **Platform Version**：平台发布版本。
 - **Kernel API Version**：内核接口合同版本。
 - **Mod Version**：Mod 自身发布版本。
+
+以上六项构成**存档域的权威版本集合**。其他规范中的近义项经**同义映射**对齐，不新增字段：`World Schema Version` ≡ `Kernel State Schema Version`（`Game Kernel — 完整项目规范` §6.2）、`Mod Schema Version` ≡ `Mod Data Schema Version`、`Kernel API Version` ≡ `API Version`、`Mod Version` ≡ `Mod code version`（`Project Architecture` §7）；`Platform Version` 涵盖 `Runtime version`（`Project Architecture` §7），不另设字段。`Game Definition Version`（完整项目规范 §6.2）作为**元数据字段** `game_definition` 记录（见 §3.2），**不并入**本版本集合；`Migration implementation`（`Project Architecture` §7）为迁移实现标识，**不属**存档元数据（见 §8）。
 
 不得假设 Mod 版本增加就一定发生了数据结构变化，也不得假设 Mod 版本未变就一定不需要迁移。
 
@@ -325,6 +337,22 @@ Compatibility Resolver 必须输出以下四类结论之一：
 9. 生成最终判定和处理计划。
 
 如果前置步骤失败，不得将后续步骤的成功当作整个存档兼容的证据。
+
+### 5.4 机器级与策略级双层分类
+
+§5.1 的四类结论是兼容性结果的**机器可读权威码**。为表达 `Game Kernel — 完整项目规范` §6.8 所述的用户/策略级粒度，兼容性报告 MUST 在机器码之外附带**策略级细化标记**，并按下列映射对齐：
+
+| 完整项目规范 §6.8（策略级） | 本规范 §5.1（机器级） | 细化标记 |
+|---|---|---|
+| 可直接加载 | `Compatible` | — |
+| 需要迁移 | `CompatibleWithMigration` | — |
+| 需要用户确认 | `CompatibleWithMigration` | `requires_user_confirmation` |
+| 需要补充依赖 | `Blocked` | `missing_dependency` |
+| 存在功能降级 | `Compatible` | `degraded` |
+| 不建议加载 | `Blocked` | `discouraged` |
+| 必须拒绝加载 | `Blocked`（结构或完整性失败时为 `Corrupted`） | `rejected` |
+
+映射表与 §13 的诊断字段共同构成兼容性报告的机器可读契约；细化标记的**最终命名**与 §13 三布尔字段的**枚举**在实现阶段（`SAVE-005`）冻结。
 
 ---
 
