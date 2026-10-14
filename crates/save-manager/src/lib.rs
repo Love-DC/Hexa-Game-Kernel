@@ -31,6 +31,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod partition;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::OnceLock;
