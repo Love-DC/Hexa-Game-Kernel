@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod integrity;
 pub mod partition;
 
 use std::collections::{BTreeMap, BTreeSet};
