@@ -9,12 +9,13 @@
 //!
 //! ## Scope boundary (frozen for this increment)
 //!
-//! * **No I/O.** Nothing here reads or writes a save on disk; every entry point
-//!   operates on in-memory values.
+//! * **No I/O in this module.** The Manifest model never reads or writes a save
+//!   on disk; every entry point here operates on in-memory values. Save-file
+//!   I/O lives exclusively in [`writer`] (`SAVE-004`).
 //! * **No digest generation.** `integrity.root_hash` is *carried*, never
 //!   produced; the value the specification uses as an example placeholder is
 //!   rejected instead of being accepted as a real checksum (`§3.3`). Producing
-//!   the digest is `SAVE-003`.
+//!   the digest is `SAVE-003` (see [`integrity`]).
 //! * **No migration, no compatibility verdict.** Migration execution is
 //!   `SAVE-006`/`SAVE-007`; the four-way compatibility classification is
 //!   `SAVE-005`.
@@ -33,6 +34,7 @@
 
 pub mod integrity;
 pub mod partition;
+pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -518,6 +518,15 @@ impl Kernel {
         &self.world
     }
 
+    /// Returns the registered System IDs in execution order (stable
+    /// lexicographic order by System ID).
+    ///
+    /// Read-only and side-effect free; the returned sequence matches the set
+    /// of systems actually registered on this Kernel (C-1).
+    pub fn registered_system_ids(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.systems.iter().map(|system| system.id())
+    }
+
     pub fn register_system(&mut self, system: Box<dyn System>) -> Result<(), KernelError> {
         let id = system.id().to_owned();
         validate_type_id(&id).map_err(|_| KernelError::InvalidSystemId(id.clone()))?;
