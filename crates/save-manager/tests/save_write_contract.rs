@@ -458,6 +458,12 @@ fn rename_over_a_readonly_target_fails_and_preserves_the_old_archive() {
 /// structured I/O error and the old archive is untouched. The temporary file
 /// lives in the same directory, so the failure surfaces at `Create` here; the
 /// Unix `Rename`-stage mapping is covered by the directory-target test below.
+///
+/// Root and other privileged environments bypass directory permission bits, so
+/// the test first probes whether the locked directory actually rejects writes.
+/// When it does not, the permission-denial scenario cannot be simulated here:
+/// the test reports itself as skipped and returns without running the failure
+/// assertions.
 #[cfg(unix)]
 #[test]
 fn an_unwritable_directory_fails_and_preserves_the_old_archive() {
@@ -471,6 +477,41 @@ fn an_unwritable_directory_fails_and_preserves_the_old_archive() {
     let mut locked = std::fs::metadata(&dir).expect("metadata").permissions();
     locked.set_mode(0o555);
     std::fs::set_permissions(&dir, locked).expect("lock directory");
+
+    // Runtime capability check: elevated environments (root, CAP_DAC_OVERRIDE)
+    // ignore directory permission bits. Probe with an independent file; only
+    // assert the save failure when the probe confirms writes are denied.
+    let probe = dir.join(".write-probe");
+    let write_blocked = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(error) => {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "probe creation failed with a non-permission error: {error}"
+            );
+            true
+        }
+    };
+
+    if !write_blocked {
+        eprintln!(
+            "SKIP: running with elevated privileges; a 0o555 directory does not \
+             restrict writes, so the permission-denial scenario is not applicable"
+        );
+        let mut unlocked = std::fs::metadata(&dir).expect("metadata").permissions();
+        unlocked.set_mode(0o755);
+        std::fs::set_permissions(&dir, unlocked).expect("unlock directory");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
 
     let error = save(&target, &manifest(), b"new world", &mod_partitions(), &[])
         .expect_err("save into a locked directory must fail");
