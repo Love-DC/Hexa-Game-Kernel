@@ -2,11 +2,11 @@
 
 - Document Type: Kernel Module Contract
 - Version: 1.0.0
-- Status: Design Baseline — P2 kernel subset implemented and verified; extensions remain out of scope until specified
+- Status: Design Baseline — P2 kernel subset implemented and verified; GK-KERNEL-01/02 are scoped post-P2 extensions, locally validated on 2026-10-20 (Kernel layer only; platform integration not covered)
 - Parent Specification: `Game Kernel — 完整项目规范 v1.0.md`
 - Scope: Kernel responsibilities, authoritative state, Tick execution, commands, events, identity, errors, and determinism
 
-> This document refines the Kernel requirements in the parent specification. The accepted P2 subset is identified explicitly and its evidence is recorded in `planning/08-P2-Kernel契约硬化草案.md`. Requirements outside that subset remain design targets, not verified implementation claims.
+> This document refines the Kernel requirements in the parent specification. The accepted P2 subset is identified explicitly and its evidence is recorded in `planning/08-P2-Kernel契约硬化草案.md`. GK-KERNEL-01/02 add narrowly scoped System registration guarantees; implementation and focused tests are recorded in `planning/drafts/`. Local validation was performed on 2026-10-20: `cargo test -p kernel-core` exited 0, with `registered_system_ids` 14/14 passed, `kernel-core` unit tests 14/14 passed, and the canonical v2 golden vector `state_hash_uses_canonical_v2_encoding` passed. This evidence covers the Kernel layer only — it is local Windows evidence, it does not cover the platform integration path, and it does not close the coordinator-consistency question tracked as GAP-23. Other requirements outside those scopes remain design targets, not verified implementation claims.
 
 ## 1. Purpose
 
@@ -79,7 +79,7 @@ The accepted P2 Tick representation is `u64`; increment uses checked arithmetic,
 
 ## 5. Scheduler contract
 
-The accepted P2 scheduler executes registered Systems serially in stable System ID order. A dependency graph, phases, and parallel scheduling are future capabilities, not supported by the current Kernel API.
+The accepted P2 scheduler executes registered Systems serially in stable System ID order. Under GK-KERNEL-01, the Kernel captures each System ID once during registration and uses the captured ID for duplicate detection, scheduling order, the registered-ID manifest, Kernel-generated command diagnostics, and command attribution. Under GK-KERNEL-02, `register_systems` validates a complete batch before committing any member; a returned validation error leaves the registered set unchanged. `register_system` uses the same single-item path. A dependency graph, phases, and parallel scheduling are future capabilities, not supported by the current Kernel API.
 
 Requirements:
 
@@ -108,7 +108,7 @@ The full System contract must declare or otherwise make testable:
 - Relevant deterministic requirements.
 - Error behavior.
 
-The accepted P2 subset provides stable System identity, serial execution, read-only World access, returned Commands, and failure reporting. It does not yet implement execution conditions, access descriptors, or dependency metadata.
+The accepted P2 subset provides stable System identity, serial execution, read-only World access, returned Commands, and failure reporting. On each registration attempt, the Kernel calls `System::id()` at most once; a successful registration freezes the validated ID for the lifetime of that registration. Later changes to the value returned by the System do not change its identity or execution order. The Kernel does not call `id()` again for an already registered System. Kernel-generated command diagnostics and command attribution use the frozen ID. Batch registration validates IDs before changing the registered set and either registers every member or returns an error without registering any member. The Kernel does not yet implement execution conditions, access descriptors, or dependency metadata.
 - Tests proving its contract.
 
 During a System's execution, it may read permitted state and produce command requests. It must not directly modify authoritative World state.

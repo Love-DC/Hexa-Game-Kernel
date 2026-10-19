@@ -423,6 +423,13 @@ impl KernelErrorCode {
 }
 
 pub trait System: Send + Sync {
+    /// Returns the System's registration identity.
+    ///
+    /// The Kernel calls this once when registration is attempted. A successful
+    /// registration freezes that value for duplicate detection, manifest reads,
+    /// execution ordering, Kernel-generated command diagnostics, and command
+    /// attribution. Changing the returned value afterward has no effect on the
+    /// registered identity.
     fn id(&self) -> &str;
     fn execute(&self, world: &World, tick: Tick) -> Result<Vec<Command>, SystemError>;
 }
@@ -491,8 +498,13 @@ impl Rejection {
 
 pub struct Kernel {
     world: World,
-    systems: Vec<Box<dyn System>>,
+    systems: Vec<RegisteredSystem>,
     fault: Option<String>,
+}
+
+struct RegisteredSystem {
+    id: String,
+    system: Box<dyn System>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -522,20 +534,40 @@ impl Kernel {
     /// lexicographic order by System ID).
     ///
     /// Read-only and side-effect free; the returned sequence matches the set
-    /// of systems actually registered on this Kernel (C-1).
+    /// of systems actually registered on this Kernel (C-1). IDs are captured
+    /// at successful registration and never re-read from the System instance.
     pub fn registered_system_ids(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.systems.iter().map(|system| system.id())
+        self.systems.iter().map(|registered| registered.id.as_str())
     }
 
     pub fn register_system(&mut self, system: Box<dyn System>) -> Result<(), KernelError> {
-        let id = system.id().to_owned();
-        validate_type_id(&id).map_err(|_| KernelError::InvalidSystemId(id.clone()))?;
-        if self.systems.iter().any(|registered| registered.id() == id) {
-            return Err(KernelError::DuplicateSystemId(id));
+        self.register_systems(vec![system])
+    }
+
+    /// Atomically registers a batch of Systems.
+    ///
+    /// All IDs are captured and validated before the Kernel's registration set
+    /// changes. If any ID is invalid or duplicated (within the batch or against
+    /// an existing registration), the method returns an error without registering
+    /// any System from this batch. Successful registrations are ordered by their
+    /// frozen IDs, matching repeated calls to `register_system` for a valid set.
+    pub fn register_systems(&mut self, systems: Vec<Box<dyn System>>) -> Result<(), KernelError> {
+        let mut pending = Vec::with_capacity(systems.len());
+        let mut batch_ids = BTreeSet::new();
+
+        for system in systems {
+            let id = system.id().to_owned();
+            validate_type_id(&id).map_err(|_| KernelError::InvalidSystemId(id.clone()))?;
+            if self.systems.iter().any(|registered| registered.id == id)
+                || !batch_ids.insert(id.clone())
+            {
+                return Err(KernelError::DuplicateSystemId(id));
+            }
+            pending.push(RegisteredSystem { id, system });
         }
-        self.systems.push(system);
-        self.systems
-            .sort_by(|left, right| left.id().cmp(right.id()));
+
+        self.systems.extend(pending);
+        self.systems.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(())
     }
 
@@ -619,9 +651,9 @@ impl Kernel {
         // All systems read the same world after external commands. Their outputs are
         // applied later in stable SystemId order, never through mutable World access.
         let mut system_outputs = Vec::with_capacity(self.systems.len());
-        for system in &self.systems {
-            match system.execute(&staged, current_tick) {
-                Ok(commands) => system_outputs.push((system.id().to_owned(), commands)),
+        for registered in &self.systems {
+            match registered.system.execute(&staged, current_tick) {
+                Ok(commands) => system_outputs.push((registered.id.clone(), commands)),
                 Err(error) => {
                     self.fault = Some(error.to_string());
                     return Err(KernelError::SystemFailed(error));
