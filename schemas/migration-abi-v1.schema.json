@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/migration-abi-v1.schema.json",
+  "title": "Game Kernel migration guest ABI v1",
+  "description": "JSON bytes exchanged in the reserved Wasm memory buffers by the no-import SAVE-007 migration guest ABI.",
+  "anyOf": [
+    { "$ref": "#/$defs/migrationInput" },
+    { "$ref": "#/$defs/migrationOutput" }
+  ],
+  "$defs": {
+    "byteArray": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0, "maximum": 255 }
+    },
+    "migrationInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["world", "mods"],
+      "properties": {
+        "world": { "oneOf": [{ "$ref": "#/$defs/byteArray" }, { "type": "null" }] },
+        "mods": {
+          "type": "object",
+          "propertyNames": { "minLength": 1, "maxLength": 128 },
+          "additionalProperties": { "$ref": "#/$defs/byteArray" }
+        }
+      }
+    },
+    "migrationOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["world", "mods"],
+      "properties": {
+        "world": { "oneOf": [{ "$ref": "#/$defs/byteArray" }, { "type": "null" }] },
+        "mods": {
+          "type": "object",
+          "propertyNames": { "minLength": 1, "maxLength": 128 },
+          "additionalProperties": { "$ref": "#/$defs/byteArray" }
+        }
+      }
+    }
+  }
+}

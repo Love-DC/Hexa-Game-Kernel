@@ -14,7 +14,7 @@
 //!   file I/O** (contract §13; enforced by a crate-level discipline test).
 //! * **No read/load API** (DC-5), no demo wiring (DC-8), no success-record
 //!   persistence (§6 step 9 / §16), no orphan temp-file cleanup (SAVE-007),
-//!   no fault-injection framework, no parent-directory sync and no
+//!   no production fault-injection API, no parent-directory sync and no
 //!   power-loss durability claim (DC-3 constraints).
 //! * Concurrent saves to one path follow **S1**: the last successful
 //!   committer wins, with no logical-ordering guarantee (DC-11).
@@ -544,6 +544,24 @@ pub fn save(
     mod_partitions: &[SavePartition],
     system_ids: &[&str],
 ) -> Result<SaveOutcome, SaveError> {
+    save_impl(
+        target,
+        manifest,
+        world_snapshot,
+        mod_partitions,
+        system_ids,
+        None,
+    )
+}
+
+fn save_impl(
+    target: &Path,
+    manifest: &SaveManifest,
+    world_snapshot: &[u8],
+    mod_partitions: &[SavePartition],
+    system_ids: &[&str],
+    injected_failure: Option<InjectedFailure>,
+) -> Result<SaveOutcome, SaveError> {
     manifest.validate().map_err(SaveError::Manifest)?;
     let system_manifest = encode_system_manifest(system_ids).map_err(SaveError::SystemManifest)?;
 
@@ -595,11 +613,19 @@ pub fn save(
 
     // Step 7/8: same-directory temporary file, exclusive create, write, sync.
     let temp = temp_path_for(target);
+    if injected_failure.is_some_and(|failure| failure.stage == IoStage::Create) {
+        return Err(injected_io_error(injected_failure.unwrap(), &temp));
+    }
     let mut file = create_temp(&temp).map_err(|source| SaveError::Io {
         stage: IoStage::Create,
         path: temp.clone(),
         source,
     })?;
+    if injected_failure.is_some_and(|failure| failure.stage == IoStage::Write) {
+        drop(file);
+        remove_temp(&temp);
+        return Err(injected_io_error(injected_failure.unwrap(), &temp));
+    }
     if let Err(source) = file.write_all(&bytes) {
         remove_temp(&temp);
         return Err(SaveError::Io {
@@ -607,6 +633,11 @@ pub fn save(
             path: temp,
             source,
         });
+    }
+    if injected_failure.is_some_and(|failure| failure.stage == IoStage::Sync) {
+        drop(file);
+        remove_temp(&temp);
+        return Err(injected_io_error(injected_failure.unwrap(), &temp));
     }
     if let Err(source) = file.sync_all() {
         remove_temp(&temp);
@@ -620,6 +651,10 @@ pub fn save(
 
     // Step 9: read back, decode and verify. A structural failure propagates
     // its own layer's error; a digest disagreement is `Verify`.
+    if injected_failure.is_some_and(|failure| failure.stage == IoStage::Readback) {
+        remove_temp(&temp);
+        return Err(injected_io_error(injected_failure.unwrap(), &temp));
+    }
     let readback = match std::fs::read(&temp) {
         Ok(bytes) => bytes,
         Err(source) => {
@@ -651,6 +686,10 @@ pub fn save(
     }
 
     // Step 10/11: replace the formal archive via rename; only then succeed.
+    if injected_failure.is_some_and(|failure| failure.stage == IoStage::Rename) {
+        remove_temp(&temp);
+        return Err(injected_io_error(injected_failure.unwrap(), target));
+    }
     std::fs::rename(&temp, target).map_err(|source| {
         remove_temp(&temp);
         SaveError::Io {
@@ -665,9 +704,26 @@ pub fn save(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InjectedFailure {
+    stage: IoStage,
+    kind: io::ErrorKind,
+}
+
+fn injected_io_error(failure: InjectedFailure, path: &Path) -> SaveError {
+    SaveError::Io {
+        stage: failure.stage,
+        path: path.to_path_buf(),
+        source: io::Error::new(failure.kind, "test-only injected save failure"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition::ModNamespace;
+    use crate::{GameDefinition, Integrity, SaveFormatVersion, SaveModEntry, SimulationConfig};
+    use kernel_core::Tick;
 
     fn unit_temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -709,5 +765,130 @@ mod tests {
         assert_eq!(std::fs::read(&temp).expect("read first"), b"first");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn contract_manifest() -> SaveManifest {
+        SaveManifest {
+            save_format_version: SaveFormatVersion::new(1, 0),
+            save_id: "save004.injected".into(),
+            created_at: "2026-10-19T00:00:00Z".into(),
+            last_saved_at: "2026-10-19T00:00:00Z".into(),
+            platform_version: "1.0.0".into(),
+            game_definition: GameDefinition {
+                id: "org.example.game".into(),
+                version: "1.0.0".into(),
+            },
+            kernel_api_version: "1.0".into(),
+            world_schema_version: "1.0".into(),
+            logical_tick: Tick(0),
+            mods: vec![SaveModEntry {
+                id: "org.example.mod".into(),
+                version: "1.0.0".into(),
+                schema_version: "1.0".into(),
+            }],
+            simulation_config: SimulationConfig::new(),
+            integrity: Integrity {
+                algorithm: "sha256".into(),
+                root_hash: "0".repeat(64),
+            },
+        }
+    }
+
+    #[test]
+    fn injected_io_failures_at_each_commit_stage_preserve_previous_save() {
+        let dir = unit_temp_dir("fault-injection");
+        let target = dir.join("world.gksave");
+        let manifest = contract_manifest();
+        let mod_data = [SavePartition::new(
+            SavePartitionId::Mod(ModNamespace::parse("org.example.mod").unwrap()),
+            b"persistent-data",
+        )];
+        let systems = ["org.example.mod.system"];
+        save(&target, &manifest, b"previous-world", &mod_data, &systems).unwrap();
+        let previous = std::fs::read(&target).unwrap();
+
+        for stage in [
+            IoStage::Create,
+            IoStage::Write,
+            IoStage::Sync,
+            IoStage::Readback,
+            IoStage::Rename,
+        ] {
+            let error = save_impl(
+                &target,
+                &manifest,
+                b"replacement-world",
+                &mod_data,
+                &systems,
+                Some(InjectedFailure {
+                    stage,
+                    kind: io::ErrorKind::Other,
+                }),
+            )
+            .unwrap_err();
+            assert!(matches!(error, SaveError::Io { stage: actual, .. } if actual == stage));
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                previous,
+                "failure at {stage:?} replaced existing save"
+            );
+            assert!(crate::loader::inspect_save_file(&target).is_ok());
+            let entries: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "failure at {stage:?} left a temporary file"
+            );
+            assert_eq!(entries[0].path(), target);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn simulated_disk_full_is_reported_at_write_and_preserves_old_save() {
+        let dir = unit_temp_dir("disk-full");
+        let target = dir.join("active.gksave");
+        save(
+            &target,
+            &contract_manifest(),
+            b"last-confirmed-world",
+            &[],
+            &[],
+        )
+        .expect("write last confirmed valid save");
+        let old = std::fs::read(&target).expect("read previous save");
+        let error = save_impl(
+            &target,
+            &contract_manifest(),
+            b"new-world",
+            &[],
+            &[],
+            Some(InjectedFailure {
+                stage: IoStage::Write,
+                kind: io::ErrorKind::StorageFull,
+            }),
+        )
+        .expect_err("simulated storage exhaustion must fail");
+        assert!(matches!(
+            error,
+            SaveError::Io {
+                stage: IoStage::Write,
+                source,
+                ..
+            } if source.kind() == io::ErrorKind::StorageFull
+        ));
+        let preserved = std::fs::read(&target).expect("read old save");
+        assert_eq!(preserved, old);
+        assert!(crate::loader::inspect_save(&preserved).is_ok());
+        let entries = std::fs::read_dir(&dir)
+            .expect("list temp directory")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![target.file_name().unwrap()]);
+        std::fs::remove_file(&target).expect("remove test target");
+        std::fs::remove_dir(&dir).expect("remove test directory");
     }
 }

@@ -629,15 +629,17 @@ fn concurrent_saves_commit_whole_generations_and_last_writer_wins() {
 // Crate-level I/O discipline (contract §13)
 // ---------------------------------------------------------------------------
 
-/// `writer.rs` is the only production module allowed to perform save file
-/// I/O. Every other `src/*.rs` file must stay free of filesystem, network,
-/// process and time access, and of `unsafe`.
+/// `writer.rs`, `loader.rs`, `transaction.rs`, and `backup.rs` are the only production
+/// modules allowed to perform save file I/O: normal save (`SAVE-004`),
+/// read-only inspection (`SAVE-005`), and migration transaction/recovery
+/// (`SAVE-007`, planning/39; `SAVE-008`, planning/41). Every other `src/*.rs` file stays free of file,
+/// network, process and time access, and of `unsafe`.
 ///
 /// Registered exception (contract §13 allows a documented exception list):
 /// the crate root's `#![forbid(unsafe_code)]` attribute contains the token
 /// `unsafe` and is scrubbed before the scan.
 #[test]
-fn only_writer_performs_save_io() {
+fn save_io_is_confined_to_writer_and_loader() {
     const FORBIDDEN: [&str; 6] = [
         "std::fs",
         "std::net",
@@ -653,7 +655,12 @@ fn only_writer_performs_save_io() {
         let entry = entry.expect("directory entry");
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "rs")
-            && path.file_name().is_some_and(|name| name != "writer.rs")
+            && path.file_name().is_some_and(|name| {
+                name != "writer.rs"
+                    && name != "loader.rs"
+                    && name != "transaction.rs"
+                    && name != "backup.rs"
+            })
         {
             let text = std::fs::read_to_string(&path).expect("read source file");
             let scrubbed: String = text
@@ -664,7 +671,7 @@ fn only_writer_performs_save_io() {
             for token in FORBIDDEN {
                 assert!(
                     !scrubbed.contains(token),
-                    "{} must not contain `{token}` (save I/O is confined to writer.rs)",
+                    "{} must not contain `{token}` (save I/O is confined to the documented I/O modules)",
                     path.display()
                 );
             }
@@ -672,9 +679,24 @@ fn only_writer_performs_save_io() {
         }
     }
     assert!(
-        scanned >= 3,
-        "expected at least lib/partition/integrity sources"
+        scanned >= 4,
+        "expected at least lib/compat/partition/integrity sources"
     );
+
+    let backup_path = src.join("backup.rs");
+    let backup = std::fs::read_to_string(&backup_path).expect("read backup.rs");
+    for token in [
+        "std::net",
+        "std::time",
+        "SystemTime",
+        "std::process",
+        "unsafe",
+    ] {
+        assert!(
+            !backup.contains(token),
+            "backup.rs must not contain `{token}`"
+        );
+    }
 
     // writer.rs itself must stay within its charter: file I/O and the process
     // ID only — no network, no clock, no process spawning, no unsafe code.
@@ -690,6 +712,53 @@ fn only_writer_performs_save_io() {
         assert!(
             !writer.contains(token),
             "writer.rs must not contain `{token}`"
+        );
+    }
+
+    // loader.rs itself must stay within its charter (planning/34 §10 "I/O
+    // 纪律"): the read-only inspection entry — `std::fs::read` only, no
+    // writes, no network, no clock, no process access, no unsafe code.
+    let loader_path = src.join("loader.rs");
+    let loader = std::fs::read_to_string(&loader_path).expect("read loader.rs");
+    assert!(
+        loader.contains("std::fs::read"),
+        "loader.rs must read save bytes via `std::fs::read`"
+    );
+    for token in [
+        "std::net",
+        "std::time",
+        "SystemTime",
+        "std::process",
+        "std::fs::write",
+        "fs::create",
+        "fs::remove",
+        "fs::rename",
+        "OpenOptions",
+        "File::create",
+        "sync_all",
+        "unsafe",
+    ] {
+        assert!(
+            !loader.contains(token),
+            "loader.rs must not contain `{token}`"
+        );
+    }
+
+    // SAVE-007 may perform filesystem operations and read the process ID for
+    // collision-resistant transaction names, but no network, clock, process
+    // spawning or unsafe access.
+    let transaction_path = src.join("transaction.rs");
+    let transaction = std::fs::read_to_string(&transaction_path).expect("transaction.rs");
+    for token in [
+        "std::net",
+        "std::time",
+        "SystemTime",
+        "std::process::Command",
+        "unsafe",
+    ] {
+        assert!(
+            !transaction.contains(token),
+            "transaction.rs must not contain `{token}`"
         );
     }
 }

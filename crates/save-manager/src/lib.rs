@@ -1,39 +1,39 @@
-//! `SAVE-001`: save Manifest model, version model and validation.
+//! P4 Save & Compatibility System implementation (`SAVE-001` through
+//! `SAVE-012`; see `planning/22-P4-存档兼容与重放任务卡草案.md`). It provides
+//! the versioned Manifest and partition model, integrity generation and
+//! verification, atomic save/load, compatibility assessment, migration
+//! planning and transaction recovery, backup/restore, Mod change planning,
+//! cross-Mod reference validation, and structured diagnostics.
 //!
-//! This crate is the first increment of the P4 Save System (`SAVE-001`, see
-//! `planning/22-P4-存档兼容与重放任务卡草案.md` §五). It implements **only**
-//! the in-memory save Manifest contract described by the *Save & Compatibility
-//! Specification v1.0* (`§3.2` required metadata, `§3.3` example, `§3.4`
-//! format/data version separation) plus the format-version comparison that
-//! §12.2 depends on.
+//! ## Module boundaries
 //!
-//! ## Scope boundary (frozen for this increment)
-//!
-//! * **No I/O in this module.** The Manifest model never reads or writes a save
-//!   on disk; every entry point here operates on in-memory values. Save-file
-//!   I/O lives exclusively in [`writer`] (`SAVE-004`).
-//! * **No digest generation.** `integrity.root_hash` is *carried*, never
-//!   produced; the value the specification uses as an example placeholder is
-//!   rejected instead of being accepted as a real checksum (`§3.3`). Producing
-//!   the digest is `SAVE-003` (see [`integrity`]).
-//! * **No migration, no compatibility verdict.** Migration execution is
-//!   `SAVE-006`/`SAVE-007`; the four-way compatibility classification is
-//!   `SAVE-005`.
-//! * **No Kernel dependency inversion.** This crate is a platform crate and may
-//!   depend on `kernel-core` (`Project Architecture v1.0` §4.2); `kernel-core`
-//!   MUST NOT depend on it.
-//!
-//! Validation is **dual-track**: the embedded JSON Schema
-//! ([`SAVE_MANIFEST_SCHEMA_JSON`]) checks structure, field names, types and
-//! format syntax, while [`SaveManifest::validate`] enforces value-level
-//! semantics. Both must pass. Errors carry a **stable code** plus a **JSON
-//! Pointer** to the offending field; the human-readable message is never part
-//! of the protocol.
+//! * Manifest validation remains dual-track: [`SAVE_MANIFEST_SCHEMA_JSON`]
+//!   checks structure and syntax; [`SaveManifest::validate`] checks semantics.
+//!   Errors use stable codes and JSON Pointers.
+//! * [`integrity`] defines canonical digests; [`writer`] generates and records
+//!   them. The `root_hash` field is not trusted as a caller supplied digest.
+//! * File I/O is confined to the explicit save/backup/transaction modules;
+//!   compatibility, migration registration, Mod change policy, and reference
+//!   extraction remain independently testable contracts.
+//! * `kernel-core` remains authoritative for World state and does not depend on
+//!   this crate. Save code stores Kernel snapshots as opaque bytes until an
+//!   explicitly supplied validator restores and validates them.
+//! * Mod data is opaque to Save System. Platform integrations provide scoped
+//!   payloads and trusted reference extractors; this crate does not give Mods
+//!   mutable World access or unrestricted storage APIs.
 
 #![forbid(unsafe_code)]
 
+pub mod backup;
+pub mod compat;
+pub mod diagnostics;
 pub mod integrity;
+pub mod loader;
+pub mod migration;
+pub mod mod_changes;
 pub mod partition;
+pub mod references;
+pub mod transaction;
 pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -725,7 +725,7 @@ fn is_valid_save_id(value: &str) -> bool {
     last_was_alnum
 }
 
-fn is_valid_timestamp(value: &str) -> bool {
+pub(crate) fn is_valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20 {
         return false;

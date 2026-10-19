@@ -507,12 +507,14 @@ version = "0.1.0"
 dependencies = [
  "jsonschema",
  "kernel-core",
+ "save-manager",
  "semver",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]

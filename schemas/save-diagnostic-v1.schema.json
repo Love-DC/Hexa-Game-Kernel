@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://game-kernel.invalid/schemas/save-diagnostic-v1.schema.json",
+  "title": "Game Kernel Save Diagnostic v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["report_version", "outcome", "code", "save_id", "affected_mods", "current_version", "recorded_version", "failed_condition", "available_actions", "needs_backup", "may_lose_data", "may_auto_continue"],
+  "properties": {
+    "report_version": {"const": 1},
+    "outcome": {"enum": ["compatible", "compatible_with_migration", "blocked", "corrupted", "failed"]},
+    "code": {"type": "string", "minLength": 1},
+    "save_id": {"type": ["string", "null"]},
+    "affected_mods": {"type": "array", "items": {"type": "string"}},
+    "current_version": {"type": ["string", "null"]},
+    "recorded_version": {"type": ["string", "null"]},
+    "failed_condition": {"type": "string"},
+    "available_actions": {"type": "array", "items": {"type": "string"}},
+    "needs_backup": {"type": "boolean"},
+    "may_lose_data": {"type": "boolean"},
+    "may_auto_continue": {"type": "boolean"}
+  }
+}

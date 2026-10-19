@@ -134,6 +134,8 @@ World data must not expose mutable internals that allow callers to bypass the Co
 
 The precise storage layout is an implementation choice unless it changes public semantics or determinism.
 
+Snapshot capture is defined only at the quiescent point after a committed Tick; a snapshot never exposes staged mid-Tick state. Mutual exclusion between `step` and `snapshot` on a single Kernel instance follows from Rust borrowing (`&mut self` vs `&self`); synchronizing cross-thread sharing of a Kernel is the caller's responsibility — the Kernel provides no synchronization primitives.
+
 ## 8. Command Pipeline and Tick commit semantics
 
 ### 8.1 General rules
@@ -231,6 +233,7 @@ The Kernel public API must expose only the minimum required operations for:
 
 - Constructing and configuring a Kernel instance.
 - Registering or removing Systems under defined lifecycle rules.
+- Enumerating registered System identities in execution order (read-only).
 - Advancing one Tick.
 - Submitting or consuming permitted authoritative inputs.
 - Inspecting permitted state.

@@ -16,6 +16,8 @@ use wasmtime::{
     WasmFeatures,
 };
 
+pub mod migration_runtime;
+
 /// Re-export of the Wasmtime engine type so external consumers and contract
 /// tests can name it without depending on the Wasmtime crate directly.
 pub use wasmtime::Engine as WasmEngine;
@@ -609,20 +611,10 @@ pub enum FaultCategory {
     ApiInvocation,
     WasmTrap,
     ResourceLimit,
-    /// Category reserved for §12.1 `DeterminismViolation`.
-    ///
-    /// NOTE: only the category and its stable code exist in this build. The
-    /// actual violation-detection capability is NOT implemented (see the
-    /// O-6-1 unmet item in the frozen design). No detection result may be
-    /// fabricated for this category.
+    /// Category for observed deterministic-input/output disagreement.
     Determinism,
     Lifecycle,
-    /// Category reserved for §12.1 `MigrationError`.
-    ///
-    /// NOTE: only the category and its stable code exist in this build. The
-    /// actual migration-failure detection capability is NOT implemented (see
-    /// the O-6-2 unmet item in the frozen design). No detection result may be
-    /// fabricated for this category.
+    /// Category for a failed save migration transaction.
     Migration,
 }
 
@@ -824,6 +816,139 @@ pub struct RollbackOutcome {
     pub discarded_work: Option<bool>,
 }
 
+/// Bounded same-process monitor for migration determinism observations.
+/// `context` must canonically include migrator code identity, configuration,
+/// and every input byte that can affect execution. Identical context with a
+/// different output is a detected `DeterminismViolation`.
+#[derive(Clone, Debug)]
+pub struct MigrationDeterminismMonitor {
+    capacity: usize,
+    observations: BTreeMap<(String, String, String), String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeterminismObservation {
+    FirstObservation {
+        input_digest: String,
+        output_digest: String,
+    },
+    MatchingRepeat {
+        input_digest: String,
+        output_digest: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeterminismViolation {
+    pub mod_id: String,
+    pub migrator_id: String,
+    pub input_digest: String,
+    pub expected_output_digest: String,
+    pub observed_output_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeterminismMonitorError {
+    CapacityReached { capacity: usize },
+    InvalidObservation,
+    Violation(DeterminismViolation),
+}
+
+impl MigrationDeterminismMonitor {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            observations: BTreeMap::new(),
+        }
+    }
+
+    pub fn observe(
+        &mut self,
+        mod_id: &str,
+        migrator_id: &str,
+        context: &[u8],
+        output: &[u8],
+    ) -> Result<DeterminismObservation, DeterminismMonitorError> {
+        if mod_id.is_empty()
+            || migrator_id.is_empty()
+            || mod_id.len() > 128
+            || migrator_id.len() > 128
+        {
+            return Err(DeterminismMonitorError::InvalidObservation);
+        }
+        let input_digest = migration_input_digest(mod_id, migrator_id, context);
+        let output_digest = migration_output_digest(output);
+        let key = (
+            mod_id.to_owned(),
+            migrator_id.to_owned(),
+            input_digest.clone(),
+        );
+        if let Some(previous) = self.observations.get(&key) {
+            if previous == &output_digest {
+                return Ok(DeterminismObservation::MatchingRepeat {
+                    input_digest,
+                    output_digest,
+                });
+            }
+            return Err(DeterminismMonitorError::Violation(DeterminismViolation {
+                mod_id: mod_id.to_owned(),
+                migrator_id: migrator_id.to_owned(),
+                input_digest,
+                expected_output_digest: previous.clone(),
+                observed_output_digest: output_digest,
+            }));
+        }
+        if self.observations.len() >= self.capacity {
+            return Err(DeterminismMonitorError::CapacityReached {
+                capacity: self.capacity,
+            });
+        }
+        self.observations.insert(key, output_digest.clone());
+        Ok(DeterminismObservation::FirstObservation {
+            input_digest,
+            output_digest,
+        })
+    }
+}
+
+impl DeterminismViolation {
+    pub fn to_fault_report(&self) -> ModFaultReport {
+        ModFaultReport::new(
+            "platform.mod.determinism_violation",
+            format!(
+                "migrator {} produced {} for repeated input {}; expected {}",
+                self.migrator_id,
+                self.observed_output_digest,
+                self.input_digest,
+                self.expected_output_digest,
+            ),
+        )
+        .with_mod_id(self.mod_id.clone())
+    }
+}
+
+fn migration_input_digest(mod_id: &str, migrator_id: &str, context: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"game-kernel-migration-observation-input-v1\0");
+    for bytes in [mod_id.as_bytes(), migrator_id.as_bytes(), context] {
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bytes);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn migration_output_digest(output: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"game-kernel-migration-observation-output-v1\0");
+    hasher.update(
+        u64::try_from(output.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(output);
+    format!("{:x}", hasher.finalize())
+}
+
 /// Versioned, machine-readable Platform fault report.
 ///
 /// Independent of the Kernel's `SystemError`. `message` is human-readable only
@@ -975,6 +1100,29 @@ impl ModFaultReport {
             report.content_digest = Some(digest.clone());
         }
         report
+    }
+
+    /// Converts a SAVE-007 transaction failure into the frozen Platform
+    /// migration fault category, including the recovery result.
+    pub fn from_save_migration_error(
+        mod_id: impl Into<String>,
+        error: &save_manager::transaction::TransactionError,
+        rollback: RollbackOutcome,
+    ) -> Self {
+        let code = match error {
+            save_manager::transaction::TransactionError::Runner { failure, .. }
+                if failure.code == "platform.mod.determinism_violation" =>
+            {
+                "platform.mod.determinism_violation"
+            }
+            _ => "platform.mod.migration_failed",
+        };
+        Self::new(
+            code,
+            format!("save migration failed ({}): {error}", error.code()),
+        )
+        .with_mod_id(mod_id)
+        .with_rollback(rollback)
     }
 
     /// Maps a Platform error to a report using the frozen category mapping.

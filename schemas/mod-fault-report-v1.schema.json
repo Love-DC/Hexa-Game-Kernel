@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://game-kernel.invalid/schemas/mod-fault-report-v1.schema.json",
   "title": "Game Kernel Mod Fault Report v1",
-  "description": "Structural schema for the unified Platform fault report (GK-P3-06), frozen as design rev2. Covers all 14 error categories of Mod Platform Specification v1.0 section 12.1. Unknown-field policy: v1 rejects unknown fields (additionalProperties:false); any field-set change MUST bump report_version. `message` is human-readable and MUST NOT be used as a machine protocol field. NOTE: the `determinism` and `migration` categories are placeholders; their detection capability is NOT implemented (unmet items O-6-1 / O-6-2).",
+  "description": "Structural schema for the unified Platform fault report (GK-P3-06), frozen as design rev2 and extended with observed P4 determinism and migration failures. Covers all 14 error categories of Mod Platform Specification v1.0 section 12.1. Unknown-field policy: v1 rejects unknown fields (additionalProperties:false); any field-set change MUST bump report_version. `message` is human-readable and MUST NOT be used as a machine protocol field. Determinism reports require repeated identical migration context with differing output; migration reports originate from a failed SAVE-007 transaction and include its recovery outcome.",
   "type": "object",
   "additionalProperties": false,
   "required": [

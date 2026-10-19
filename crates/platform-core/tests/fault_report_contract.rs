@@ -17,16 +17,16 @@
 //! * T-10 `SystemError` -> `ModFaultReport` is one-way; Kernel has no reverse dep
 //! * T-11 budget configurable with `config_version`; no perf claim
 //!
-//! O-6-1 / O-6-2: the `determinism` / `migration` categories exist as
-//! placeholders only. No test fabricates a detection result for them; they are
-//! covered solely as *code/decision table* entries.
+//! O-6-1 / O-6-2: observed deterministic migration divergence and SAVE-007
+//! transaction failure map to actual, schema-valid Platform fault reports.
 
 use std::collections::BTreeSet;
 
 use game_platform::{
-    Disposition, FAULT_REPORT_VERSION, FaultCategory, FaultPhase, LimitKind, LoadedWasmMod,
+    DeterminismMonitorError, DeterminismObservation, Disposition, FAULT_REPORT_VERSION,
+    FaultCategory, FaultPhase, LimitKind, LoadedWasmMod, MigrationDeterminismMonitor,
     ModFailureCode, ModFaultReport, ModPackage, PlatformError, RecoveryAdvice, ResourceUse,
-    SeverityGrade, create_wasm_engine, validate_fault_report_value,
+    RollbackOutcome, SeverityGrade, create_wasm_engine, validate_fault_report_value,
 };
 use kernel_core::{ComponentValue, Kernel, KernelError, StepInput, Tick, World, WorldId};
 
@@ -594,17 +594,111 @@ fn schema_rejects_fix_manifest_without_mod_id() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn determinism_and_migration_placeholders_carry_no_detection_claim() {
-    // Only the category + code + decision exist. There is no API that "detects"
-    // a determinism violation or migration failure, so these tests assert only
-    // the placeholder decision table entries.
-    let determinism = ModFaultReport::new("platform.mod.determinism_violation", "placeholder");
-    assert_eq!(determinism.category, FaultCategory::Determinism);
-    let migration = ModFaultReport::new("platform.mod.migration_failed", "placeholder");
-    assert_eq!(migration.category, FaultCategory::Migration);
-    // The Schema itself flags them as placeholders in its description.
-    assert!(game_platform::MOD_FAULT_REPORT_SCHEMA.contains("O-6-1"));
-    assert!(game_platform::MOD_FAULT_REPORT_SCHEMA.contains("O-6-2"));
+fn repeated_migration_observation_detects_divergence_and_reports_it() {
+    let mut monitor = MigrationDeterminismMonitor::new(2);
+    let first = monitor
+        .observe(
+            "org.example.mod",
+            "org.example.migrate.1-2",
+            b"fixed input",
+            b"result A",
+        )
+        .unwrap();
+    assert!(matches!(
+        first,
+        DeterminismObservation::FirstObservation { .. }
+    ));
+    assert!(matches!(
+        monitor.observe(
+            "org.example.mod",
+            "org.example.migrate.1-2",
+            b"fixed input",
+            b"result A"
+        ),
+        Ok(DeterminismObservation::MatchingRepeat { .. })
+    ));
+    let error = monitor
+        .observe(
+            "org.example.mod",
+            "org.example.migrate.1-2",
+            b"fixed input",
+            b"result B",
+        )
+        .unwrap_err();
+    let DeterminismMonitorError::Violation(violation) = error else {
+        panic!("expected determinism violation");
+    };
+    let report = violation.to_fault_report();
+    assert_eq!(report.category, FaultCategory::Determinism);
+    assert_eq!(report.code, "platform.mod.determinism_violation");
+    assert_eq!(report.disposition, Disposition::Rebuild);
+    assert_eq!(report.mod_id.as_deref(), Some("org.example.mod"));
+    validate_fault_report_value(&serde_json::to_value(report).unwrap()).unwrap();
+}
+
+#[test]
+fn save_migration_transaction_failure_becomes_recoverable_platform_report() {
+    let error = save_manager::transaction::TransactionError::Input {
+        code: "save.migration.source_changed",
+        message: "source root changed".into(),
+    };
+    let report = ModFaultReport::from_save_migration_error(
+        "org.example.mod",
+        &error,
+        RollbackOutcome {
+            executed: true,
+            succeeded: Some(true),
+            discarded_work: Some(true),
+        },
+    );
+    assert_eq!(report.category, FaultCategory::Migration);
+    assert_eq!(report.code, "platform.mod.migration_failed");
+    assert_eq!(report.mod_id.as_deref(), Some("org.example.mod"));
+    assert_eq!(
+        report.rollback.as_ref().and_then(|r| r.succeeded),
+        Some(true)
+    );
+    validate_fault_report_value(&serde_json::to_value(report).unwrap()).unwrap();
+}
+
+#[test]
+fn save_migration_determinism_failure_keeps_its_specific_platform_code() {
+    let error = save_manager::transaction::TransactionError::Runner {
+        step: 0,
+        migrator_id: "org.example.mod.migrate.1-2".into(),
+        failure: save_manager::transaction::RunnerFailure {
+            code: "platform.mod.determinism_violation".into(),
+            message: "repeated output differed".into(),
+        },
+    };
+    let report = ModFaultReport::from_save_migration_error(
+        "org.example.mod",
+        &error,
+        RollbackOutcome {
+            executed: true,
+            succeeded: Some(true),
+            discarded_work: Some(true),
+        },
+    );
+    assert_eq!(report.category, FaultCategory::Determinism);
+    assert_eq!(report.code, "platform.mod.determinism_violation");
+    assert_eq!(
+        report.rollback.as_ref().and_then(|r| r.succeeded),
+        Some(true)
+    );
+    validate_fault_report_value(&serde_json::to_value(report).unwrap()).unwrap();
+}
+
+#[test]
+fn determinism_monitor_capacity_is_explicit_and_non_silent() {
+    let mut monitor = MigrationDeterminismMonitor::new(1);
+    monitor
+        .observe("org.example.mod", "migrate-a", b"input-a", b"output")
+        .unwrap();
+    assert!(matches!(
+        monitor.observe("org.example.mod", "migrate-b", b"input-b", b"output"),
+        Err(DeterminismMonitorError::CapacityReached { capacity: 1 })
+    ));
 }
 
 // ---------------------------------------------------------------------------
