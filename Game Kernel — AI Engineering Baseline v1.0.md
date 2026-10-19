@@ -287,6 +287,7 @@ The initial baseline must inspect existing files such as `rust-toolchain`, `rust
 - If authoritative state consistency is unknown, do not silently continue normal simulation.
 - A diagnostic message should explain the cause, impact, and likely next action where possible.
 
+
 ## 11. Documentation and decision records
 
 Update documentation whenever a change alters:

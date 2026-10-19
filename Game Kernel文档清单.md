@@ -9,27 +9,27 @@
 
 ## 1. 根目录文件
 
-| 文件名 | 用途 | 建议状态 |
-|---|---|---|
-| `Game Kernel — 完整项目规范 v1.0.md` | 项目总规范；定义项目目标、架构范围、核心原则和最终验收要求 | 权威总规范 |
-| `Kernel Contract v1.0.md` | 定义 Kernel 的 Tick、World、Command、System、Event、确定性、错误处理与快照/恢复契约 | 核心专项规范 |
-| `Project Architecture v1.0.md` | 定义工程分层、模块职责、依赖方向与目录架构 | 架构专项规范 |
-| `Mod Platform Specification v1.0.md` | 定义 Mod 生命周期、依赖解析、运行时、API Registry、权限与资源限制 | 平台专项规范 |
-| `Save & Compatibility Specification v1.0.md` | 定义存档元数据、数据所有权、兼容性判断、迁移、备份与恢复 | 平台专项规范 |
-| `Multiplayer Specification v1.0.md` | 定义联机权威模型、输入排序、同步、断线恢复和 Mod 联机资格 | 平台专项规范 |
-| `Security, Performance & Diagnostics Specification v1.0.md` | 定义安全边界、资源预算、性能测试与诊断报告 | 横向专项规范 |
-| `Game Kernel — AI Engineering Baseline v1.0.md` | 定义 AI 开发流程、工具链、目录规则、任务卡、测试、Git 与验收纪律 | AI 工程规范 |
-| `README.md` | 项目入口说明、快速开始与文档导航 | 项目说明 |
-| `rust-toolchain` 或 `rust-toolchain.toml` | 声明 Rust 工具链版本；实际仓库应统一采用并保留一种约定 | 工具链配置 |
+| 文件名                                                         | 用途                                                           | 建议状态    |
+| ----------------------------------------------------------- | ------------------------------------------------------------ | ------- |
+| `Game Kernel — 完整项目规范 v1.0.md`                              | 项目总规范；定义项目目标、架构范围、核心原则和最终验收要求                                | 权威总规范   |
+| `Kernel Contract v1.0.md`                                   | 定义 Kernel 的 Tick、World、Command、System、Event、确定性、错误处理与快照/恢复契约 | 核心专项规范  |
+| `Project Architecture v1.0.md`                              | 定义工程分层、模块职责、依赖方向与目录架构                                        | 架构专项规范  |
+| `Mod Platform Specification v1.0.md`                        | 定义 Mod 生命周期、依赖解析、运行时、API Registry、权限与资源限制                    | 平台专项规范  |
+| `Save & Compatibility Specification v1.0.md`                | 定义存档元数据、数据所有权、兼容性判断、迁移、备份与恢复                                 | 平台专项规范  |
+| `Multiplayer Specification v1.0.md`                         | 定义联机权威模型、输入排序、同步、断线恢复和 Mod 联机资格                              | 平台专项规范  |
+| `Security, Performance & Diagnostics Specification v1.0.md` | 定义安全边界、资源预算、性能测试与诊断报告                                        | 横向专项规范  |
+| `Game Kernel — AI Engineering Baseline v1.0.md`             | 定义 AI 开发流程、工具链、目录规则、任务卡、测试、Git 与验收纪律                         | AI 工程规范 |
+| `README.md`                                                 | 项目入口说明、快速开始与文档导航                                             | 项目说明    |
+| `rust-toolchain` 或 `rust-toolchain.toml`                    | 声明 Rust 工具链版本；实际仓库应统一采用并保留一种约定                               | 工具链配置   |
 
 ## 2. planning/ 规划文件
 
 以下文件名来自现有规划记录，写入本清单前应核对仓库内的实际路径和名称。
 
-| 文件名 | 用途 | 建议处理 |
-|---|---|---|
-| `planning/03-分阶段开发路线图.md` | 分阶段开发路线与阶段验收安排 | 保留；与总规范第 19 节对照 |
-| `planning/06-AI开发与验收流程.md` | AI 开发和验收工作流程 | 保留或合并重复内容；以本清单所列 AI 工程基线作为统一入口 |
+| 文件名                        | 用途             | 建议处理                           |
+| -------------------------- | -------------- | ------------------------------ |
+| `planning/03-分阶段开发路线图.md`  | 分阶段开发路线与阶段验收安排 | 保留；与总规范第 19 节对照                |
+| `planning/06-AI开发与验收流程.md` | AI 开发和验收工作流程   | 保留或合并重复内容；以本清单所列 AI 工程基线作为统一入口 |
 
 ## 3. 文档优先级与冲突处理
 
