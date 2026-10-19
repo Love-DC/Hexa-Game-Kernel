@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use game_platform::migration_runtime::{WasmMigrationRunner, migration_engine};
 use game_platform::{ModFaultReport, RollbackOutcome, validate_fault_report_value};
@@ -117,13 +118,16 @@ fn execute_transaction(
         save_manager::transaction::TransactionError,
     >,
 ) {
+    // Unique per process run. A monotonically increasing counter is used instead
+    // of wall-clock time: concurrent test threads share this process ID, and on
+    // Windows `SystemTime` resolution (~100ns) is coarse enough that two threads
+    // can observe the same instant and therefore build the *same* directory,
+    // which then contends for one migration journal lock.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "gk-migration-runtime-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let target = dir.join("campaign.gksave");
