@@ -1,10 +1,10 @@
 # P3 任务卡：Mod Platform 基线
 
 - 阶段：P3
-- 状态：P3 执行中；GK-P3-01 已通过本地与 Gitee Go 验收，GK-P3-02 已通过本地门禁与远端 Gitee Go 验收（构建 #11/#13，2026-10-14 确认）
+- 状态：**P3 已结束：有条件通过（2026-10-14，GK-P3-18）**。依据本卡 §9.1 及 `planning/19-P3-07-第一阶段执行报告.md` §9：GK-P3-01～GK-P3-07 的任务卡验收条件均满足，D-1～D-7 已关闭；P3 退出时 GAP-18～GAP-25 均已登记但仍未解决，不因阶段有条件通过而视为已关闭。CI 覆盖范围按 §9 记录：P3-05/P3-06 仅由最终集成构建 #16 验证，没有独立构建记录。
 - 依据：`Game Kernel — 完整项目规范 v1.0.md` 第 4、5、8、12、13 章；`Mod Platform Specification v1.0.md`；`Kernel Contract v1.0.md`；`planning/03-分阶段开发路线图.md`；已验收的 P2 Kernel API
 - 当前代码基线：`crates/platform-core` 包含严格 JSON Manifest 解析、本地目录发现、必需依赖 SemVer 校验、确定性拓扑解析、内存 LoadPlan、宿主权限授权和 Wasmtime 适配；目前仅有 `gk::counter_read` / `gk::counter_set` 两个 Host API。
-- 规范边界：`Mod Platform Specification v1.0.md` 现已作为 P3 的领域规范基线。本卡定义本阶段实际实现的子集；规范中尚未实现的可选依赖、Provider/多候选策略、完整 API Registry、扩展生命周期和运行时资源管理属于后续 P3 工作包或后续阶段，不能仅凭规范存在就标记为已实现。发现与已验收 Kernel 契约冲突时，先登记并对齐再实现。
+- 规范边界：`Mod Platform Specification v1.0.md` 是 P3 的领域规范基线。本卡及 §9 记录 P3 实际验收的子集与仍未解决的限制；可选依赖、Provider/多候选策略、Mod 间 API 等未实现能力不因 P3 有条件通过而视为已交付。任何后续增量仍须服从已验收 Kernel 契约及单独批准的任务卡。
 
 ## 目标与范围
 
