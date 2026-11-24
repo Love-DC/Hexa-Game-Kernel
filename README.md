@@ -8,8 +8,6 @@ The workspace also contains a bounded P4 Save & Compatibility subsystem: `crates
 
 The repository still does not include P5 networking, a Launcher UI, an SDK/store workflow, hot loading, or native Mod execution. Runtime capabilities remain limited to the approved contracts and allow-list.
 
-
-
 ## Requirements
 
 - Rust 1.99.0 (toolchain pinned in `rust-toolchain.toml`)
