@@ -8,7 +8,7 @@ The workspace also contains a bounded P4 Save & Compatibility subsystem: `crates
 
 The repository still does not include P5 networking, a Launcher UI, an SDK/store workflow, hot loading, or native Mod execution. Runtime capabilities remain limited to the approved contracts and allow-list.
 
-This is a prototype. It does not implement the complete v1.0 Kernel, Mod, Save, or Multiplayer specifications. In particular, the current demonstration supports only integer counter state, one restricted Mod Host API, and development WAT as well as Wasm bytecode. It does not include a Launcher UI, networking, migration, a store, hot loading, or native Mod execution.
+
 
 ## Requirements
 
