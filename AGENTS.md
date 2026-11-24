@@ -3,7 +3,9 @@
 ## Project status
 
 - P1 headless vertical slice and P2 Kernel contract hardening have been approved and accepted; see `planning/07-P1实施与验收报告.md` and `planning/08-P2-Kernel契约硬化草案.md` for evidence and boundaries.
-- P3 Mod Platform baseline is the current stage; follow `planning/09-P3-Mod平台基线任务卡.md` before changing Platform modules.
+- P3 Mod Platform baseline ended with a **conditional pass** on 2026-10-14. Its acceptance boundaries and limitations are recorded in `planning/09-P3-Mod平台基线任务卡.md` and the authoritative exit ruling `planning/19-P3-07-第一阶段执行报告.md` §9; do not treat the wider Mod Platform specification as fully implemented.
+- The current engineering/evidence stage is **P4 Save & Compatibility**. The repository records P4 local acceptance in `planning/49-P4-阶段本地最终验收报告.md` and `planning/21-全仓库现状与能力验收报告.md` §10. Those records do not establish Gitee Go remote acceptance; preserve the distinction between local, GitHub Actions, Gitee Go, and cross-platform evidence.
+- `planning/22-P4-存档兼容与重放任务卡草案.md` remains **DRAFT** and R-18 has not been executed. Treat it as planning/evidence, not blanket implementation authority: execute only work covered by an explicitly authorized RAE task and its approved contract. Do not infer that P5 is ready or start P5 from this status pointer.
 - Current code is a prototype and does not prove the full v1.0 specifications.
 - Read the relevant planning task card before changing a module. Preserve the status distinctions in `planning/06-AI开发与验收流程.md`.
 - `Game Kernel — 完整项目规范 v1.0.md` is the umbrella specification. Root-level domain specifications refine it; `planning/` task cards define phase scope and acceptance. The accepted Kernel behavior is recorded in `Kernel Contract v1.0.md` and `planning/08-P2-Kernel契约硬化草案.md`. A specification's existence does not mean its full scope is implemented; follow the current task card and report unresolved conflicts before coding.
