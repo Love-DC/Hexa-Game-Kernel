@@ -338,3 +338,12 @@ kernel-core                   ──► （工作区内无依赖）
 ---
 
 > 本报告生成后，检查任务即告完成。未启动任何后续开发任务；工作区 6 项遗留与 Git 历史保持原状。
+
+
+---
+
+## 当前状态取代说明（2026-11-27）
+
+本文件是 2026-10-16 的历史进度报告。文中 `origin = https://gitee.com/DCjx/hexa-game-kernel.git`、Gitee Go 构建记录，以及当时对 GitHub Actions 是否启用的判断，均只描述报告生成时的仓库和 CI 状态，保留作为历史审计事实，不再代表当前配置。
+
+截至 2026-11-27，六核当前正式代码仓库已切换为 GitHub `Love-DC/Hexa-Game-Kernel`，当前 CI 入口为 `.github/workflows/ci.yml`。2026-11-27 当前 GitHub `main` 精确提交 `ab746282bb418a3c2505c204e08d74917c7a6f96` 的 GitHub Actions run `45990489736` 已在 Ubuntu 24.04 与 Windows 2025 通过 `cargo fmt`、Clippy 和全 workspace tests。 旧 Gitee Go 工作流已从活动 GitHub 仓库移除；本文件中的 Gitee 远端地址、构建待核实列表和后续确认建议均已被当前状态取代。此次清理未修改或删除外部 Gitee 仓库。
