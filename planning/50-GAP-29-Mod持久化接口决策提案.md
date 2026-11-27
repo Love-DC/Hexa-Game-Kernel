@@ -24,7 +24,7 @@
 2. **Save Frozen Contract 已定义数据所有权。** `Save & Compatibility Specification v1.0.md` §4.2 要求每个 Mod 拥有以稳定 Mod ID 为基础的独立命名空间，Mod 只能通过平台公开接口访问自己的数据。
 3. **P4 B-3 明确暂缓 guest 读写通道。** `planning/28` §6 批准 Mod 数据载荷为不透明字节，并明确 P4 不实现平台 Mod 持久化读写 API；该通道只作为 GAP-29 候选，补登和实施另待授权。
 4. **当前 Host API 目录没有存储 API。** `planning/10-P3-04-API-Registry执行记录.md` 记录的已实现内置 Host API 只有 `gk::counter_read` 与 `gk::counter_set`。当前 `HOST_APIS` 注册表尚无 `storage.own` 对应调用。
-5. **资源类别不等于数据接口。** `PersistentBytes` 已出现在 Platform 的资源限额类型中，但它是预算分类，不是 guest 数据读写接口；`planning/28` §2.2 已明确区分。
+5. **资源类别不等于数据接口。** `PersistentBytes` 已出现在 Platform 的资源限额类型中，但它是预算分类，不是 guest 数据读写接口；`planning/28` §2.2 已明确区分。Security/Performance §5.3 要求预算配置有版本；§5.4 示例中的 `max_persistent_bytes = 16777216`（16 MiB）明确只是结构示例，不是最终冻结的硬上限。
 6. **P4 已验收并保留该边界。** `planning/49` 与 `planning/21` §10 记录 P4 验收通过，同时注明 Mod guest 尚无通用持久化 payload Host API。该缺口不会反向否定 SAVE-001～012 在已批准范围内的完成状态。
 
 ## 3. 设计目标与非目标
@@ -84,7 +84,7 @@
 2. **操作：** 只提供读取自身 payload 与整体替换自身 payload 两类语义。是否需要单独清空操作，可在实现契约中决定；不提供列举其他 Mod、复制或跨 Mod 访问。
 3. **版本：** payload 保持不透明，但必须能随 payload 一同读取/保存 Mod 自己声明的 Schema 版本。具体字段归属和版本编码须在实施契约中确定，不能让平台猜测字节内容。
 4. **权限：** 复用已定义的 `storage.own` 能力；实际每次调用都检查运行时 grant。Manifest 请求本身不等于自动授予。
-5. **配额：** 复用 `PersistentBytes` 资源类别作为预算入口；实现前明确单 Mod 上限、整个运行实例上限，以及写入超限时的稳定错误语义。默认值和硬上限应与 Security/Performance 规范一致，不在本提案中虚构数字。
+5. **配额：** 复用 `PersistentBytes` 资源类别作为预算入口；实现前明确单 Mod 上限、整个运行实例上限，以及写入超限时的稳定错误语义。Security/Performance §5.4 当前示例值为 16 MiB，但它不是冻结默认值或硬上限；实施契约必须由负责人批准真实配置，并为预算配置记录版本。
 6. **事务：** 写入必须由宿主暂存并纳入 Save Manager 的一致性边界；不得在 guest 调用时直接执行文件系统写入。推荐同一 Tick 的写入先进入暂存区，只有整次 Kernel Tick 最终提交成功后才提交；任一 System/Mod 执行失败导致该 Tick 不提交时，丢弃本 Tick 的全部暂存写入。不能在某个 Mod 自身成功时就提前提交，否则后续 System 失败会让持久化数据与 Kernel World 状态分叉。最终提交点仍须与 Kernel Tick 和 Save Manager 的实际事务边界核对后再冻结。
 7. **恢复与迁移：** 快照恢复后读取到已提交 payload；旧/未知 Schema 数据不得静默清空。迁移由 Save & Compatibility 既有迁移机制决定，guest API 不得绕过备份、验证、回滚和失败恢复。
 8. **错误：** 至少区分权限拒绝、缓冲区/参数错误、配额超限、未知 Schema/不兼容、执行阶段不允许以及存储事务失败；稳定错误码由实施契约定义。
