@@ -611,7 +611,7 @@ fn frozen_identity_defeats_the_original_partial_commit_reproduction() {
 /// coordinator record, but it must not cause a submitted batch to partially
 /// commit. The Kernel's atomic `register_systems` call rejects the full batch.
 #[test]
-fn residual_bypass_contamination_is_reported_not_hidden() {
+fn bypass_duplicate_rejects_the_entire_batch_atomically() {
     let mut kernel = empty_kernel();
     let mut registry = ModRegistry::new();
 
