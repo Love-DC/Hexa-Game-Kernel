@@ -134,6 +134,13 @@ pub fn create_backup(
     let inspected = inspect_save(&source_bytes).map_err(BackupError::Load)?;
     let manifest = inspected.manifest();
     let paths = BackupPaths::new(source, backup_id);
+    if paths.archive.exists() || paths.metadata.exists() {
+        return Err(input_error(
+            "save.backup.already_exists",
+            "backup ID already has a published archive or metadata sidecar",
+        ));
+    }
+
     write_new_verified(&paths.archive_temp, &source_bytes, "backup_write")?;
     let archive_check = inspect_save_file(&paths.archive_temp).map_err(BackupError::Load)?;
     if archive_check.manifest().save_id != manifest.save_id
@@ -144,8 +151,6 @@ pub fn create_backup(
             "verified temporary backup identity differs from source",
         ));
     }
-    fs::rename(&paths.archive_temp, &paths.archive)
-        .map_err(|error| io_error("backup_publish", &paths.archive, error))?;
     let metadata = BackupMetadata {
         backup_id: backup_id.to_owned(),
         save_id: manifest.save_id.clone(),
@@ -158,9 +163,18 @@ pub fn create_backup(
     };
     let metadata_bytes = serde_json::to_vec(&metadata)
         .map_err(|error| metadata_error("save.backup.invalid_metadata", error.to_string()))?;
-    write_new_verified(&paths.metadata_temp, &metadata_bytes, "metadata_write")?;
-    fs::rename(&paths.metadata_temp, &paths.metadata)
-        .map_err(|error| io_error("metadata_publish", &paths.metadata, error))?;
+
+    publish_new_file(&paths.archive_temp, &paths.archive, "backup_publish")?;
+    if let Err(error) = write_new_verified(&paths.metadata_temp, &metadata_bytes, "metadata_write")
+        .and_then(|()| publish_new_file(&paths.metadata_temp, &paths.metadata, "metadata_publish"))
+    {
+        if let Err(rollback_error) = fs::remove_file(&paths.archive)
+            && rollback_error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(io_error("backup_rollback", &paths.archive, rollback_error));
+        }
+        return Err(error);
+    }
     Ok(BackupOutcome {
         archive_path: paths.archive,
         metadata_path: paths.metadata,
@@ -372,6 +386,32 @@ impl BackupPaths {
             archive_temp: parent.join(format!(".{stem}.backup-{id}.tmp")),
             metadata: parent.join(format!(".{stem}.backup-meta-{id}")),
             metadata_temp: parent.join(format!(".{stem}.backup-meta-{id}.tmp")),
+        }
+    }
+}
+
+fn publish_new_file(
+    temporary: &Path,
+    destination: &Path,
+    stage: &'static str,
+) -> Result<(), BackupError> {
+    match fs::hard_link(temporary, destination) {
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(temporary) {
+                let _ = fs::remove_file(destination);
+                return Err(io_error("backup_temp_cleanup", temporary, error));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                return Err(input_error(
+                    "save.backup.already_exists",
+                    "backup ID already has a published archive or metadata sidecar",
+                ));
+            }
+            Err(io_error(stage, destination, error))
         }
     }
 }

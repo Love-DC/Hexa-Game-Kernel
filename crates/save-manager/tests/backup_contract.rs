@@ -219,6 +219,111 @@ fn restore_rejects_case_variant_aliases_of_backup_temporary_paths() {
 }
 
 #[test]
+fn duplicate_backup_id_preserves_the_original_verified_archive_and_metadata() {
+    let source = target();
+    let first_source_bytes = save_bytes(b"first-backup-content");
+    fs::write(&source, &first_source_bytes).unwrap();
+    let first = create_backup(
+        &source,
+        "immutable-id",
+        "2026-10-19T01:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap();
+    let original_archive = fs::read(&first.archive_path).unwrap();
+    let original_metadata = fs::read(&first.metadata_path).unwrap();
+
+    let second_source_bytes = save_bytes(b"second-backup-content");
+    fs::write(&source, &second_source_bytes).unwrap();
+    let error = create_backup(
+        &source,
+        "immutable-id",
+        "2026-10-19T02:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "save.backup.already_exists");
+    assert_eq!(fs::read(&first.archive_path).unwrap(), original_archive);
+    assert_eq!(fs::read(&first.metadata_path).unwrap(), original_metadata);
+    assert_eq!(fs::read(&source).unwrap(), second_source_bytes);
+    assert_eq!(
+        inspect_backup(&source, "immutable-id").unwrap().metadata,
+        first.metadata
+    );
+    assert!(!archive_temp_path(&source, "immutable-id").exists());
+    assert!(!metadata_temp_path(&source, "immutable-id").exists());
+    cleanup(&source, &["immutable-id"], &source);
+}
+
+#[test]
+fn backup_id_rejects_archive_only_and_metadata_only_destination_collisions() {
+    for (id, collide_with_archive) in [("archive-only", true), ("metadata-only", false)] {
+        let source = target();
+        let source_bytes = save_bytes(b"preserve-source");
+        fs::write(&source, &source_bytes).unwrap();
+        let collision_path = if collide_with_archive {
+            archive_path(&source, id)
+        } else {
+            meta_path(&source, id)
+        };
+        let collision_bytes = format!("pre-existing {id} backup artifact").into_bytes();
+        fs::write(&collision_path, &collision_bytes).unwrap();
+
+        let error = create_backup(
+            &source,
+            id,
+            "2026-10-19T01:00:00Z",
+            BackupPurpose::Manual,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "save.backup.already_exists");
+        assert_eq!(fs::read(&collision_path).unwrap(), collision_bytes);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!archive_temp_path(&source, id).exists());
+        assert!(!metadata_temp_path(&source, id).exists());
+        cleanup(&source, &[id], &source);
+    }
+}
+
+#[test]
+fn failed_metadata_write_rolls_back_only_the_new_archive() {
+    let source = target();
+    let source_bytes = save_bytes(b"preserve-source-on-metadata-failure");
+    fs::write(&source, &source_bytes).unwrap();
+    let metadata_temp = metadata_temp_path(&source, "metadata-failure");
+    let pre_existing_temp_bytes = b"do not remove or overwrite this pre-existing file".to_vec();
+    fs::write(&metadata_temp, &pre_existing_temp_bytes).unwrap();
+
+    let error = create_backup(
+        &source,
+        "metadata-failure",
+        "2026-10-19T01:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "save.backup.io");
+    assert!(!archive_path(&source, "metadata-failure").exists());
+    assert!(!meta_path(&source, "metadata-failure").exists());
+    assert!(!archive_temp_path(&source, "metadata-failure").exists());
+    assert_eq!(fs::read(&metadata_temp).unwrap(), pre_existing_temp_bytes);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+    let _ = fs::remove_file(&metadata_temp);
+    cleanup(&source, &["metadata-failure"], &source);
+}
+
+#[test]
 fn corrupt_or_mismatched_backup_is_refused_without_overwriting_target() {
     let source = target();
     let destination = target();
