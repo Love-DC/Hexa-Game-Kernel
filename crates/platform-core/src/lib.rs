@@ -3343,24 +3343,24 @@ impl ModLifecycle {
 ///
 /// For a batch submitted through [`ModRegistry::register_batch`], the effective
 /// registration ID of every element is **frozen during pre-validation** and the
-/// Kernel is handed a wrapper whose `id()` always returns that frozen value
-/// (see [`FrozenIdSystem`]). Consequently:
+/// Kernel is handed wrappers whose `id()` returns those frozen values
+/// (see [`FrozenIdSystem`]). The complete batch is then passed to the Kernel's
+/// atomic `register_systems` API. Consequently:
 ///
-/// - An unstable `System::id()` can no longer make the Kernel reject a later
-///   element after eager elements were already committed. The `id()`-drift
-///   class of partial commit is closed.
-/// - For a Kernel that holds **only** coordinator-registered Systems, every
-///   pre-validation failure mode is decided before any Kernel mutation, so the
-///   batch is all-or-nothing.
-/// - It is **not** an unconditional atomicity claim. If the target Kernel
-///   already contains a System registered *outside* this coordinator, the
-///   Kernel may still reject an element mid-batch, leaving earlier elements
-///   committed. That residual case is the pre-existing bypass limitation, not
-///   an `id()`-stability issue, and is exercised by
-///   `bypass_boundary_direct_kernel_registration_does_not_update_the_record`.
+/// - An unstable `System::id()` cannot change the identity between
+///   pre-validation and Kernel registration.
+/// - A rejection caused by a duplicate already present in the Kernel —
+///   including one registered directly outside this coordinator — leaves the
+///   entire submitted batch unregistered. Earlier elements are never partially
+///   committed.
+/// - The coordinator record is updated only after the Kernel accepts the whole
+///   batch. A direct out-of-band Kernel registration still remains invisible to
+///   this record; this is a separate global-consistency limitation tracked by
+///   GAP-23.
 ///
-/// This is a constructive guarantee for coordinator-submitted batches. It is
-/// **not** a Kernel-provided transaction or rollback facility.
+/// This guarantee is scoped to one coordinator-submitted batch. It does not
+/// provide a global registration-event feed or prevent callers from bypassing
+/// the coordinator.
 #[derive(Clone, Debug, Default)]
 pub struct ModRegistry {
     registered: BTreeSet<String>,
@@ -3502,24 +3502,41 @@ impl ModRegistry {
             pending.push((actual_id, system));
         }
 
-        // Phase 2: real registration with the frozen identity. The Kernel only
-        // ever observes the pre-validated ID because `FrozenIdSystem::id()`
-        // returns it verbatim. Each success is recorded immediately; a Kernel
-        // rejection surfaces as a diagnosable failure.
-        for (index, (frozen_id, system)) in pending.into_iter().enumerate() {
-            let frozen = Box::new(FrozenIdSystem::new(frozen_id.clone(), system));
-            kernel.register_system(frozen).map_err(|error| {
-                PlatformError::lifecycle(
-                    LifecycleFailure::new(
-                        LifecycleCode::RegistrationRejected,
-                        format!("Kernel rejected Mod ID `{frozen_id}`: {error}"),
-                    )
-                    .with_mod(frozen_id.clone())
-                    .with_batch_index(index),
+        // Phase 2: freeze every pre-validated identity and submit the complete
+        // batch through Kernel's atomic registration API. Do not update the
+        // coordinator record until the Kernel has accepted the whole batch.
+        let mut frozen_ids = Vec::with_capacity(pending.len());
+        let frozen_systems: Vec<Box<dyn System>> = pending
+            .into_iter()
+            .map(|(frozen_id, system)| {
+                frozen_ids.push(frozen_id.clone());
+                Box::new(FrozenIdSystem::new(frozen_id, system)) as Box<dyn System>
+            })
+            .collect();
+
+        if let Err(error) = kernel.register_systems(frozen_systems) {
+            let (rejected_id, batch_index) = match &error {
+                kernel_core::KernelError::InvalidSystemId(id)
+                | kernel_core::KernelError::DuplicateSystemId(id) => {
+                    let index = frozen_ids
+                        .iter()
+                        .position(|candidate| candidate == id)
+                        .unwrap_or(0);
+                    (id.clone(), index)
+                }
+                _ => (frozen_ids.first().cloned().unwrap_or_default(), 0),
+            };
+            return Err(PlatformError::lifecycle(
+                LifecycleFailure::new(
+                    LifecycleCode::RegistrationRejected,
+                    format!("Kernel rejected Mod ID `{rejected_id}`: {error}"),
                 )
-            })?;
-            self.registered.insert(frozen_id);
+                .with_mod(rejected_id)
+                .with_batch_index(batch_index),
+            ));
         }
+
+        self.registered.extend(frozen_ids);
         Ok(())
     }
 }
