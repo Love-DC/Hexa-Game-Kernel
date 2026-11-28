@@ -601,6 +601,17 @@ impl Kernel {
         });
 
         for envelope in external {
+            if command_id_counts
+                .get(&envelope.id)
+                .is_some_and(|count| *count > 1)
+            {
+                rejected.push(reject(
+                    &envelope,
+                    CommandRejectionCode::DuplicateCommandId,
+                    "duplicate command ID",
+                ));
+                continue;
+            }
             if envelope.id.tick != current_tick {
                 rejected.push(reject(
                     &envelope,
@@ -624,17 +635,6 @@ impl Kernel {
                     &envelope,
                     CommandRejectionCode::InvalidSourceId,
                     "command source uses the Kernel-reserved system namespace",
-                ));
-                continue;
-            }
-            if command_id_counts
-                .get(&envelope.id)
-                .is_some_and(|count| *count > 1)
-            {
-                rejected.push(reject(
-                    &envelope,
-                    CommandRejectionCode::DuplicateCommandId,
-                    "duplicate command ID",
                 ));
                 continue;
             }
@@ -1178,6 +1178,54 @@ mod tests {
                 .all(|rejection| rejection.code == CommandRejectionCode::DuplicateCommandId)
         );
         assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
+    }
+
+    #[test]
+    fn duplicate_command_ids_take_precedence_over_envelope_validation() {
+        let duplicate_ids = [
+            CommandId {
+                tick: Tick(1),
+                source: "org.game/player".to_owned(),
+                sequence: 1,
+            },
+            CommandId {
+                tick: Tick(0),
+                source: String::new(),
+                sequence: 2,
+            },
+            CommandId {
+                tick: Tick(0),
+                source: "system/org.game/internal".to_owned(),
+                sequence: 3,
+            },
+        ];
+
+        for duplicate_id in duplicate_ids {
+            let envelope = |value| CommandEnvelope {
+                id: duplicate_id.clone(),
+                command: Command::SetResource {
+                    key: "org.game/counter".to_owned(),
+                    value: ComponentValue::Integer(value),
+                },
+            };
+            let mut kernel = seeded_kernel(0);
+            let output = kernel
+                .step(StepInput {
+                    commands: vec![envelope(1), envelope(2)],
+                })
+                .unwrap();
+
+            assert!(output.committed_commands.is_empty());
+            assert_eq!(output.rejected_commands.len(), 2);
+            assert!(
+                output
+                    .rejected_commands
+                    .iter()
+                    .all(|rejection| rejection.code == CommandRejectionCode::DuplicateCommandId),
+                "duplicate identity must take precedence: {duplicate_id:?}"
+            );
+            assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
+        }
     }
 
     #[test]
