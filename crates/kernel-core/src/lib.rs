@@ -30,6 +30,7 @@ pub struct EntityId {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum ComponentValue {
     Integer(i64),
     Boolean(bool),
@@ -1349,6 +1350,43 @@ mod tests {
         ));
         assert!(matches!(
             Kernel::from_snapshot(br#"{"magic":"GAME_KERNEL_SNAPSHOT""#),
+            Err(KernelError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_unknown_fields_inside_resource_component_values() {
+        let snapshot = br#"{
+            "magic":"GAME_KERNEL_SNAPSHOT",
+            "format_version":2,
+            "world":{"id":7,"tick":0,"next_entity_index":0,"entities":[],"resources":{
+                "org.game/counter":{"kind":"integer","value":1,"unexpected":true}
+            }},
+            "state_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+
+        assert!(matches!(
+            Kernel::from_snapshot(snapshot),
+            Err(KernelError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_unknown_fields_inside_entity_component_values() {
+        let snapshot = br#"{
+            "magic":"GAME_KERNEL_SNAPSHOT",
+            "format_version":2,
+            "world":{"id":7,"tick":0,"next_entity_index":1,"entities":[{
+                "id":{"world":7,"index":0,"generation":0},
+                "components":{
+                    "org.game/health":{"kind":"integer","value":1,"unexpected":true}
+                }
+            }],"resources":{}},
+            "state_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+        }"#;
+
+        assert!(matches!(
+            Kernel::from_snapshot(snapshot),
             Err(KernelError::Serialization(_))
         ));
     }
