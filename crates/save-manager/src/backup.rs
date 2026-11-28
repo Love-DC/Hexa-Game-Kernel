@@ -151,7 +151,6 @@ pub fn create_backup(
             "verified temporary backup identity differs from source",
         ));
     }
-    publish_new_file(&paths.archive_temp, &paths.archive, "backup_publish")?;
     let metadata = BackupMetadata {
         backup_id: backup_id.to_owned(),
         save_id: manifest.save_id.clone(),
@@ -164,6 +163,8 @@ pub fn create_backup(
     };
     let metadata_bytes = serde_json::to_vec(&metadata)
         .map_err(|error| metadata_error("save.backup.invalid_metadata", error.to_string()))?;
+
+    publish_new_file(&paths.archive_temp, &paths.archive, "backup_publish")?;
     if let Err(error) = write_new_verified(&paths.metadata_temp, &metadata_bytes, "metadata_write")
         .and_then(|()| publish_new_file(&paths.metadata_temp, &paths.metadata, "metadata_publish"))
     {
