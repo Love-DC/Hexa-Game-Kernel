@@ -607,13 +607,9 @@ fn frozen_identity_defeats_the_original_partial_commit_reproduction() {
     assert!(!registry.contains("/illegal"));
 }
 
-/// V-1 regression: the bypass contamination case is the ONLY residual way a
-/// mid-batch rejection can occur. It must be reported honestly: the record must
-/// reflect exactly what the Kernel accepted before the failure, and must never
-/// claim the bypass id it did not register.
-///
-/// This test deliberately documents the residual partial-commit exposure rather
-/// than pretending it is closed. It is NOT a consistency guarantee.
+/// V-1 regression: a direct Kernel registration remains invisible to the
+/// coordinator record, but it must not cause a submitted batch to partially
+/// commit. The Kernel's atomic `register_systems` call rejects the full batch.
 #[test]
 fn residual_bypass_contamination_is_reported_not_hidden() {
     let mut kernel = empty_kernel();
@@ -624,31 +620,30 @@ fn residual_bypass_contamination_is_reported_not_hidden() {
         .register_system(Box::new(TestSystem::new("org.game.bypass")))
         .expect("direct registration succeeds");
 
-    // The coordinator is unaware, so pre-validation passes for a batch that
-    // names `org.game.bypass` — and the Kernel then rejects it mid-batch.
+    // The coordinator cannot see the bypass registration during pre-validation.
+    // Kernel's atomic batch call rejects the duplicate without committing the
+    // earlier fresh element.
     let error = registry
         .register_batch(
             &mut kernel,
             vec![boxed("org.game.fresh"), boxed("org.game.bypass")],
         )
-        .expect_err("the Kernel must reject the bypass-contaminated id");
+        .expect_err("the Kernel must reject the bypass-contaminated batch");
     assert_eq!(failure_code(&error), LifecycleCode::RegistrationRejected);
+    match &error {
+        game_platform::PlatformError::Lifecycle(failure) => {
+            assert_eq!(failure.mod_id.as_deref(), Some("org.game.bypass"));
+            assert_eq!(failure.batch_index, Some(1));
+        }
+        other => panic!("expected a lifecycle failure, got {other:?}"),
+    }
 
-    // Honest reporting: the record must never claim the bypass id.
-    assert!(
-        !registry.contains("org.game.bypass"),
-        "the record must never claim the bypass id"
-    );
-    // `org.game.fresh` WAS accepted by the Kernel before the failing element,
-    // and the coordinator recorded it at that moment. The record therefore
-    // reflects exactly what was committed: one element, not two, not zero.
-    // This residual partial commit is the pre-existing bypass limitation; it is
-    // reachable only when the target Kernel holds Systems registered outside
-    // this coordinator.
-    assert_eq!(registry.registered_count(), 1);
-    assert!(registry.contains("org.game.fresh"));
-    assert!(kernel_contains(&mut kernel, "org.game.fresh"));
-    assert!(kernel_contains(&mut kernel, "org.game.bypass"));
+    // No element from the failed batch may appear in either registration view.
+    assert_eq!(registry.registered_count(), 0);
+    assert!(!registry.contains("org.game.bypass"));
+    assert!(!registry.contains("org.game.fresh"));
+    let kernel_ids: Vec<_> = kernel.registered_system_ids().collect();
+    assert_eq!(kernel_ids, vec!["org.game.bypass"]);
 }
 
 /// V-1 regression: the pre-existing behaviours must be unchanged.
