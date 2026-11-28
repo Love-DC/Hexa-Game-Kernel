@@ -300,7 +300,7 @@ fn failed_metadata_write_rolls_back_only_the_new_archive() {
     fs::write(&source, &source_bytes).unwrap();
     let metadata_temp = metadata_temp_path(&source, "metadata-failure");
     let pre_existing_temp_bytes = b"do not remove or overwrite this pre-existing file".to_vec();
-    fs::write(&metadata_temp, pre_existing_temp_bytes).unwrap();
+    fs::write(&metadata_temp, &pre_existing_temp_bytes).unwrap();
 
     let error = create_backup(
         &source,
