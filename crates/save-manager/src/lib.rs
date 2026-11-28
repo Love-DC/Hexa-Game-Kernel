@@ -758,12 +758,17 @@ pub(crate) fn is_valid_timestamp(value: &str) -> bool {
     ) else {
         return false;
     };
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    let year = bytes[0..4]
+        .iter()
+        .fold(0_u32, |year, digit| year * 10 + u32::from(digit - b'0'));
+    let days_in_month = match month {
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return false,
+    };
+    if day == 0 || day > days_in_month || hour > 23 || minute > 59 || second > 60 {
         return false;
     }
     let tail = &bytes[19..];
@@ -843,8 +848,14 @@ mod tests {
         assert!(is_valid_timestamp("2026-01-01T12:00:00Z"));
         assert!(is_valid_timestamp("2026-12-31T23:59:60Z"));
         assert!(is_valid_timestamp("2026-01-01T12:00:00.500Z"));
+        assert!(is_valid_timestamp("2024-02-29T12:00:00Z"));
+        assert!(is_valid_timestamp("2026-02-28T12:00:00Z"));
+        assert!(is_valid_timestamp("2026-04-30T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-01-01T12:00:00"));
         assert!(!is_valid_timestamp("2026-13-01T12:00:00Z"));
+        assert!(!is_valid_timestamp("2026-02-29T12:00:00Z"));
+        assert!(!is_valid_timestamp("2026-02-31T12:00:00Z"));
+        assert!(!is_valid_timestamp("2026-04-31T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-01-01T24:00:00Z"));
         assert!(!is_valid_timestamp("2026-01-01 12:00:00Z"));
         assert!(!is_valid_timestamp("2026-01-01T12:00:00+08:00"));
