@@ -324,7 +324,9 @@ fn system_manifest_enforces_the_entry_count_limit() {
     oversized.extend_from_slice(&SYSTEM_MANIFEST_ENCODING_TAG);
     oversized.push(SYSTEM_MANIFEST_ENCODING_VERSION);
     oversized.extend_from_slice(
-        &u32::try_from(ids.len()).expect("fixture count fits u32").to_be_bytes(),
+        &u32::try_from(ids.len())
+            .expect("fixture count fits u32")
+            .to_be_bytes(),
     );
     for id in &ids {
         oversized.extend_from_slice(
