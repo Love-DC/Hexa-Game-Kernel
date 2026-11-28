@@ -216,10 +216,13 @@ pub fn restore_backup(
     backup_id: &str,
     target: impl AsRef<Path>,
 ) -> Result<(), BackupError> {
+    let source = source.as_ref();
     let backup = inspect_backup(source, backup_id)?;
     let bytes = fs::read(&backup.archive_path)
         .map_err(|error| io_error("backup_read", &backup.archive_path, error))?;
     let target = target.as_ref();
+    let paths = BackupPaths::new(source, backup_id);
+    reject_backup_path_collision(target, &paths)?;
     let temp = target.with_file_name(format!(".{}.restore-{backup_id}.tmp", file_stem(target)?));
     write_new_verified(&temp, &bytes, "restore_write")?;
     inspect_save_file(&temp).map_err(BackupError::Load)?;
@@ -294,6 +297,47 @@ pub fn prune_history(
         removed.push(oldest.archive_path);
     }
     Ok(removed)
+}
+
+fn reject_backup_path_collision(
+    target: &Path,
+    backup_paths: &BackupPaths,
+) -> Result<(), BackupError> {
+    let target_path = normalized_path(target)?;
+    for owned_path in [
+        &backup_paths.archive,
+        &backup_paths.archive_temp,
+        &backup_paths.metadata,
+        &backup_paths.metadata_temp,
+    ] {
+        if normalized_path(owned_path)? == target_path {
+            return Err(input_error(
+                "save.backup.target_conflict",
+                "restore target must not overlap a backup-owned path",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_path(path: &Path) -> Result<PathBuf, BackupError> {
+    if path.exists() {
+        return fs::canonicalize(path).map_err(|error| io_error("restore_path", path, error));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        input_error(
+            "save.backup.invalid_path",
+            "restore target must identify a file",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| io_error("restore_path", parent, error))?;
+    Ok(canonical_parent.join(file_name))
 }
 
 struct BackupPaths {
