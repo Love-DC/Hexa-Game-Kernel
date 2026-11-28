@@ -689,7 +689,14 @@ impl Kernel {
                     Err(reason) => {
                         let error = KernelError::InvalidSystemCommand {
                             system: system_id.clone(),
-                            reason: format!("{}: {}", reason.code.as_str(), reason.reason),
+                            reason: format!(
+                                "tick={} command_source={} command_sequence={}: {}: {}",
+                                current_tick.0,
+                                source,
+                                sequence,
+                                reason.code.as_str(),
+                                reason.reason
+                            ),
                         };
                         self.fault = Some(error.to_string());
                         return Err(error);
