@@ -315,9 +315,46 @@ fn system_manifest_enforces_the_entry_count_limit() {
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let error = writer::encode_system_manifest(&refs).expect_err("over the limit");
     assert_eq!(error.code(), SystemManifestErrorCode::Invalid);
+    assert_eq!(error.code_str(), "save.system_manifest_invalid");
     assert_eq!(error.path(), "/system_manifest/entries");
 
-    // A declared count the bytes cannot encode is rejected before allocation.
+    // Build a complete, canonical payload without using the encoder, so the
+    // decoder itself must enforce the limit rather than relying on encode().
+    let mut oversized = Vec::new();
+    oversized.extend_from_slice(&SYSTEM_MANIFEST_ENCODING_TAG);
+    oversized.push(SYSTEM_MANIFEST_ENCODING_VERSION);
+    oversized.extend_from_slice(
+        &u32::try_from(ids.len())
+            .expect("fixture count fits u32")
+            .to_be_bytes(),
+    );
+    for id in &ids {
+        oversized.extend_from_slice(
+            &u16::try_from(id.len())
+                .expect("fixture ID length fits u16")
+                .to_be_bytes(),
+        );
+        oversized.extend_from_slice(id.as_bytes());
+    }
+    let error =
+        writer::decode_system_manifest(&oversized).expect_err("decoder rejects 4097 entries");
+    assert_eq!(error.code(), SystemManifestErrorCode::Invalid);
+    assert_eq!(error.code_str(), "save.system_manifest_invalid");
+    assert_eq!(error.path(), "/system_manifest/entries");
+
+    // The exact frozen maximum remains valid in both directions.
+    let boundary_ids: Vec<String> = (0..MAX_SYSTEM_MANIFEST_ENTRIES)
+        .map(|index| format!("s{index:05}"))
+        .collect();
+    let boundary_refs: Vec<&str> = boundary_ids.iter().map(String::as_str).collect();
+    let encoded =
+        writer::encode_system_manifest(&boundary_refs).expect("4096-entry boundary encodes");
+    assert_eq!(
+        writer::decode_system_manifest(&encoded).expect("4096-entry boundary decodes"),
+        boundary_ids
+    );
+
+    // A declared count the bytes cannot encode is still rejected before allocation.
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SYSTEM_MANIFEST_ENCODING_TAG);
     bytes.push(SYSTEM_MANIFEST_ENCODING_VERSION);

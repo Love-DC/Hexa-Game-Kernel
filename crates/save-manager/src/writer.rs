@@ -238,6 +238,15 @@ pub fn decode_system_manifest(bytes: &[u8]) -> Result<Vec<String>, SystemManifes
             "system manifest entry count does not fit this platform",
         )
     })?;
+    if count > MAX_SYSTEM_MANIFEST_ENTRIES {
+        return Err(invalid_manifest(
+            "/system_manifest/entries",
+            format!(
+                "declared system ID count {count} exceeds the {MAX_SYSTEM_MANIFEST_ENTRIES}-entry limit"
+            ),
+        ));
+    }
+
     let max_encodable = reader.remaining() / MIN_ENCODED_SYSTEM_ID_LEN;
     if count > max_encodable {
         return Err(invalid_manifest(
