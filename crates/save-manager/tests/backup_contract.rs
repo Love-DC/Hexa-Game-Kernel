@@ -294,6 +294,36 @@ fn backup_id_rejects_archive_only_and_metadata_only_destination_collisions() {
 }
 
 #[test]
+fn failed_metadata_write_rolls_back_only_the_new_archive() {
+    let source = target();
+    let source_bytes = save_bytes(b"preserve-source-on-metadata-failure");
+    fs::write(&source, &source_bytes).unwrap();
+    let metadata_temp = metadata_temp_path(&source, "metadata-failure");
+    let pre_existing_temp_bytes = b"do not remove or overwrite this pre-existing file";
+    fs::write(&metadata_temp, pre_existing_temp_bytes).unwrap();
+
+    let error = create_backup(
+        &source,
+        "metadata-failure",
+        "2026-10-19T01:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "save.backup.io");
+    assert!(!archive_path(&source, "metadata-failure").exists());
+    assert!(!meta_path(&source, "metadata-failure").exists());
+    assert!(!archive_temp_path(&source, "metadata-failure").exists());
+    assert_eq!(fs::read(&metadata_temp).unwrap(), pre_existing_temp_bytes);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+
+    let _ = fs::remove_file(&metadata_temp);
+    cleanup(&source, &["metadata-failure"], &source);
+}
+
+#[test]
 fn corrupt_or_mismatched_backup_is_refused_without_overwriting_target() {
     let source = target();
     let destination = target();
