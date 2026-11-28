@@ -601,6 +601,17 @@ impl Kernel {
         });
 
         for envelope in external {
+            if command_id_counts
+                .get(&envelope.id)
+                .is_some_and(|count| *count > 1)
+            {
+                rejected.push(reject(
+                    &envelope,
+                    CommandRejectionCode::DuplicateCommandId,
+                    "duplicate command ID",
+                ));
+                continue;
+            }
             if envelope.id.tick != current_tick {
                 rejected.push(reject(
                     &envelope,
@@ -624,17 +635,6 @@ impl Kernel {
                     &envelope,
                     CommandRejectionCode::InvalidSourceId,
                     "command source uses the Kernel-reserved system namespace",
-                ));
-                continue;
-            }
-            if command_id_counts
-                .get(&envelope.id)
-                .is_some_and(|count| *count > 1)
-            {
-                rejected.push(reject(
-                    &envelope,
-                    CommandRejectionCode::DuplicateCommandId,
-                    "duplicate command ID",
                 ));
                 continue;
             }
