@@ -1214,8 +1214,14 @@ mod tests {
         assert_eq!(forward, reverse);
         assert!(forward.committed_commands.is_empty());
         assert_eq!(forward.rejected_commands.len(), 2);
-        assert_eq!(forward_kernel.world().resource_i64("org.game/counter"), Some(0));
-        assert_eq!(reverse_kernel.world().resource_i64("org.game/counter"), Some(0));
+        assert_eq!(
+            forward_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
+        assert_eq!(
+            reverse_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
         assert_eq!(forward.state_hash, reverse.state_hash);
     }
 
