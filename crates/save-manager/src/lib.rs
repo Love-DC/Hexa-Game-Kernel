@@ -849,10 +849,12 @@ mod tests {
         assert!(is_valid_timestamp("2026-12-31T23:59:60Z"));
         assert!(is_valid_timestamp("2026-01-01T12:00:00.500Z"));
         assert!(is_valid_timestamp("2024-02-29T12:00:00Z"));
+        assert!(is_valid_timestamp("2000-02-29T12:00:00Z"));
         assert!(is_valid_timestamp("2026-02-28T12:00:00Z"));
         assert!(is_valid_timestamp("2026-04-30T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-01-01T12:00:00"));
         assert!(!is_valid_timestamp("2026-13-01T12:00:00Z"));
+        assert!(!is_valid_timestamp("1900-02-29T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-02-29T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-02-31T12:00:00Z"));
         assert!(!is_valid_timestamp("2026-04-31T12:00:00Z"));
