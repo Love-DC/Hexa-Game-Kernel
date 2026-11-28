@@ -654,7 +654,11 @@ impl Kernel {
         for registered in &self.systems {
             match registered.system.execute(&staged, current_tick) {
                 Ok(commands) => system_outputs.push((registered.id.clone(), commands)),
-                Err(error) => {
+                Err(mut error) => {
+                    // The Kernel owns the registration identity and executing Tick.
+                    // Do not trust a System's self-reported diagnostic coordinates.
+                    error.system = registered.id.clone();
+                    error.tick = current_tick;
                     self.fault = Some(error.to_string());
                     return Err(KernelError::SystemFailed(error));
                 }
