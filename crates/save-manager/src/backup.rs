@@ -310,7 +310,8 @@ fn reject_backup_path_collision(
         &backup_paths.metadata,
         &backup_paths.metadata_temp,
     ] {
-        if normalized_path(owned_path)? == target_path {
+        let owned_path = normalized_path(owned_path)?;
+        if paths_match_for_host(&owned_path, &target_path) {
             return Err(input_error(
                 "save.backup.target_conflict",
                 "restore target must not overlap a backup-owned path",
@@ -318,6 +319,18 @@ fn reject_backup_path_collision(
         }
     }
     Ok(())
+}
+
+fn paths_match_for_host(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    }
+
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf, BackupError> {

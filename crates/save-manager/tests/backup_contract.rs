@@ -95,6 +95,16 @@ fn metadata_temp_path(source: &Path, id: &str) -> PathBuf {
     ))
 }
 
+#[cfg(windows)]
+fn windows_case_variant(path: &Path) -> PathBuf {
+    path.with_file_name(
+        path.file_name()
+            .expect("backup path has a file name")
+            .to_string_lossy()
+            .to_uppercase(),
+    )
+}
+
 fn cleanup(source: &Path, ids: &[&str], target: &Path) {
     let _ = fs::remove_file(source);
     let _ = fs::remove_file(target);
@@ -169,6 +179,43 @@ fn restore_rejects_backup_owned_archive_and_sidecar_destinations() {
     assert!(!temporary_paths[0].exists());
     assert!(!temporary_paths[1].exists());
     cleanup(&source, &["manual-owned-paths"], &source);
+}
+
+#[cfg(windows)]
+#[test]
+fn restore_rejects_case_variant_aliases_of_backup_temporary_paths() {
+    let source = target();
+    let source_bytes = save_bytes(b"windows-case-alias-source");
+    fs::write(&source, &source_bytes).unwrap();
+    let backup = create_backup(
+        &source,
+        "windows-case-alias",
+        "2026-10-19T01:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap();
+    let archive_bytes = fs::read(&backup.archive_path).unwrap();
+    let metadata_bytes = fs::read(&backup.metadata_path).unwrap();
+    let temporary_paths = [
+        archive_temp_path(&source, "windows-case-alias"),
+        metadata_temp_path(&source, "windows-case-alias"),
+    ];
+
+    for reserved_path in &temporary_paths {
+        let alias = windows_case_variant(reserved_path);
+        assert_ne!(alias, *reserved_path);
+        let error = restore_backup(&source, "windows-case-alias", &alias).unwrap_err();
+        assert_eq!(error.code(), "save.backup.target_conflict");
+        assert_eq!(fs::read(&backup.archive_path).unwrap(), archive_bytes);
+        assert_eq!(fs::read(&backup.metadata_path).unwrap(), metadata_bytes);
+        assert!(inspect_backup(&source, "windows-case-alias").is_ok());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(!reserved_path.exists());
+    }
+
+    cleanup(&source, &["windows-case-alias"], &source);
 }
 
 #[test]
