@@ -3368,13 +3368,13 @@ pub struct ModRegistry {
 
 /// A `System` wrapper that pins the identity the Kernel observes.
 ///
-/// The Kernel reads a System's identity by calling `System::id()` — once to
-/// validate, again to scan for duplicates, and again when sorting. A `System`
-/// whose `id()` returns a different value on different calls can therefore pass
-/// pre-validation and still fail (or be recorded under the wrong name) during
-/// registration. Wrapping the System in this adapter makes `id()` return one
-/// frozen string for the entire registration, so the identity that was
-/// pre-validated is exactly the identity the Kernel commits.
+/// The coordinator reads the wrapped System's identity once during
+/// pre-validation, then gives the Kernel a wrapper whose `id()` always returns
+/// that captured value. The Kernel's atomic `register_systems` operation also
+/// captures each supplied ID once and uses its stored value for duplicate
+/// detection and execution ordering. This adapter therefore guarantees that
+/// the ID validated by the coordinator is exactly the ID captured by the Kernel,
+/// even when the wrapped System's own `id()` would later drift.
 ///
 /// `execute` is delegated to the wrapped System unchanged.
 struct FrozenIdSystem {
