@@ -81,6 +81,20 @@ fn meta_path(source: &Path, id: &str) -> PathBuf {
     ))
 }
 
+fn archive_temp_path(source: &Path, id: &str) -> PathBuf {
+    source.with_file_name(format!(
+        ".{}.backup-{id}.tmp",
+        source.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn metadata_temp_path(source: &Path, id: &str) -> PathBuf {
+    source.with_file_name(format!(
+        ".{}.backup-meta-{id}.tmp",
+        source.file_name().unwrap().to_string_lossy()
+    ))
+}
+
 fn cleanup(source: &Path, ids: &[&str], target: &Path) {
     let _ = fs::remove_file(source);
     let _ = fs::remove_file(target);
@@ -114,6 +128,47 @@ fn backup_roundtrip_restores_verified_archive_and_keeps_source_backup() {
     assert_eq!(fs::read(&source).unwrap(), original);
     assert!(outcome.archive_path.exists());
     cleanup(&source, &["manual-1"], &source);
+}
+
+#[test]
+fn restore_rejects_backup_owned_archive_and_sidecar_destinations() {
+    let source = target();
+    let source_bytes = save_bytes(b"restore-source");
+    fs::write(&source, &source_bytes).unwrap();
+    let backup = create_backup(
+        &source,
+        "manual-owned-paths",
+        "2026-10-19T01:00:00Z",
+        BackupPurpose::Manual,
+        None,
+        None,
+    )
+    .unwrap();
+    let archive_bytes = fs::read(&backup.archive_path).unwrap();
+    let metadata_bytes = fs::read(&backup.metadata_path).unwrap();
+    let temporary_paths = [
+        archive_temp_path(&source, "manual-owned-paths"),
+        metadata_temp_path(&source, "manual-owned-paths"),
+    ];
+    let collision_targets = [
+        backup.archive_path.clone(),
+        backup.metadata_path.clone(),
+        temporary_paths[0].clone(),
+        temporary_paths[1].clone(),
+    ];
+
+    for collision_target in collision_targets {
+        let error = restore_backup(&source, "manual-owned-paths", &collision_target).unwrap_err();
+        assert_eq!(error.code(), "save.backup.target_conflict");
+        assert_eq!(fs::read(&backup.archive_path).unwrap(), archive_bytes);
+        assert_eq!(fs::read(&backup.metadata_path).unwrap(), metadata_bytes);
+        assert!(inspect_backup(&source, "manual-owned-paths").is_ok());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    }
+
+    assert!(!temporary_paths[0].exists());
+    assert!(!temporary_paths[1].exists());
+    cleanup(&source, &["manual-owned-paths"], &source);
 }
 
 #[test]
