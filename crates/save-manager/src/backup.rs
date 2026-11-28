@@ -168,11 +168,10 @@ pub fn create_backup(
     if let Err(error) = write_new_verified(&paths.metadata_temp, &metadata_bytes, "metadata_write")
         .and_then(|()| publish_new_file(&paths.metadata_temp, &paths.metadata, "metadata_publish"))
     {
-        match fs::remove_file(&paths.archive) {
-            Err(rollback_error) if rollback_error.kind() != io::ErrorKind::NotFound => {
-                return Err(io_error("backup_rollback", &paths.archive, rollback_error));
-            }
-            _ => {}
+        if let Err(rollback_error) = fs::remove_file(&paths.archive)
+            && rollback_error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(io_error("backup_rollback", &paths.archive, rollback_error));
         }
         return Err(error);
     }
