@@ -12,15 +12,13 @@ impl System for MisreportingSystem {
     }
 
     fn execute(&self, _world: &World, _tick: Tick) -> Result<Vec<Command>, SystemError> {
-        Err(
-            SystemError::new(
-                "org.game/spoofed",
-                Tick(999),
-                "test.system_failure",
-                "synthetic failure",
-            )
-            .with_source_digest("source-digest-v1"),
+        Err(SystemError::new(
+            "org.game/spoofed",
+            Tick(999),
+            "test.system_failure",
+            "synthetic failure",
         )
+        .with_source_digest("source-digest-v1"))
     }
 }
 
