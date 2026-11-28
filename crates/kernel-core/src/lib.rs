@@ -589,23 +589,18 @@ impl Kernel {
         let mut committed = Vec::new();
         let mut rejected = Vec::new();
         let mut events = Vec::new();
-        let mut seen_ids = BTreeSet::new();
         let mut last_sequence_by_source = BTreeMap::<String, u64>::new();
 
         let mut external = input.commands;
+        let mut command_id_counts = BTreeMap::<CommandId, usize>::new();
+        for envelope in &external {
+            *command_id_counts.entry(envelope.id.clone()).or_default() += 1;
+        }
         external.sort_by(|left, right| {
             (&left.id.source, left.id.sequence).cmp(&(&right.id.source, right.id.sequence))
         });
 
         for envelope in external {
-            if !seen_ids.insert(envelope.id.clone()) {
-                rejected.push(reject(
-                    &envelope,
-                    CommandRejectionCode::DuplicateCommandId,
-                    "duplicate command ID",
-                ));
-                continue;
-            }
             if envelope.id.tick != current_tick {
                 rejected.push(reject(
                     &envelope,
@@ -629,6 +624,17 @@ impl Kernel {
                     &envelope,
                     CommandRejectionCode::InvalidSourceId,
                     "command source uses the Kernel-reserved system namespace",
+                ));
+                continue;
+            }
+            if command_id_counts
+                .get(&envelope.id)
+                .is_some_and(|count| *count > 1)
+            {
+                rejected.push(reject(
+                    &envelope,
+                    CommandRejectionCode::DuplicateCommandId,
+                    "duplicate command ID",
                 ));
                 continue;
             }
@@ -1148,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_command_id_is_rejected() {
+    fn duplicate_command_id_is_rejected_for_every_envelope() {
         let mut kernel = seeded_kernel(0);
         let envelope = command(
             0,
@@ -1163,12 +1169,60 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(output.committed_commands.len(), 1);
-        assert_eq!(output.rejected_commands.len(), 1);
-        assert_eq!(
-            output.rejected_commands[0].code,
-            CommandRejectionCode::DuplicateCommandId
+        assert!(output.committed_commands.is_empty());
+        assert_eq!(output.rejected_commands.len(), 2);
+        assert!(
+            output
+                .rejected_commands
+                .iter()
+                .all(|rejection| rejection.code == CommandRejectionCode::DuplicateCommandId)
         );
+        assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
+    }
+
+    #[test]
+    fn conflicting_duplicate_command_ids_are_independent_of_arrival_order() {
+        let first = command(
+            0,
+            Command::SetResource {
+                key: "org.game/counter".to_owned(),
+                value: ComponentValue::Integer(1),
+            },
+        );
+        let second = command(
+            0,
+            Command::SetResource {
+                key: "org.game/counter".to_owned(),
+                value: ComponentValue::Integer(2),
+            },
+        );
+
+        let mut forward_kernel = seeded_kernel(0);
+        let forward = forward_kernel
+            .step(StepInput {
+                commands: vec![first.clone(), second.clone()],
+            })
+            .unwrap();
+
+        let mut reverse_kernel = seeded_kernel(0);
+        let reverse = reverse_kernel
+            .step(StepInput {
+                commands: vec![second, first],
+            })
+            .unwrap();
+
+        assert_eq!(forward, reverse);
+        assert!(forward.committed_commands.is_empty());
+        assert_eq!(forward.rejected_commands.len(), 2);
+        assert_eq!(
+            forward_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
+        assert_eq!(
+            reverse_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
+        assert_eq!(forward.state_hash, reverse.state_hash);
     }
 
     #[test]
