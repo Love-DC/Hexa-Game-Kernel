@@ -3440,11 +3440,12 @@ impl ModRegistry {
     /// 4. Kernel's own ID rule, reusing `kernel_core::validate_type_id` so this
     ///    layer never maintains a second, drifting rule set.
     ///
-    /// Only if every element passes is the batch committed to the Kernel. Each
-    /// Kernel registration is still fallible (see the type-level note on the
-    /// residual bypass case), and a rejection fails the whole batch with
-    /// [`LifecycleCode::RegistrationRejected`]. IDs are written to the record
-    /// **only after** the corresponding `register_system` call returns `Ok`.
+    /// Only if every element passes is the complete batch submitted once to
+    /// `Kernel::register_systems`. The Kernel validates the full set before
+    /// changing its registration collection, so a duplicate already present
+    /// in the Kernel (including an out-of-coordinator registration) rejects the
+    /// entire batch without partial registration. The coordinator record is
+    /// extended only after that single atomic call returns `Ok`.
     pub fn register_batch(
         &mut self,
         kernel: &mut Kernel,
