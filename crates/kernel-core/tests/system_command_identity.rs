@@ -66,8 +66,5 @@ fn external_command_cannot_impersonate_a_kernel_generated_system_command() {
 
     assert_eq!(output.events.len(), 1);
     assert_eq!(output.events[0].source, "system/org.game/counter-writer");
-    assert_eq!(
-        kernel.world().resource_i64("org.game/counter"),
-        Some(1)
-    );
+    assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(1));
 }
