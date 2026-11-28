@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const SNAPSHOT_MAGIC: &str = "GAME_KERNEL_SNAPSHOT";
+// Kernel-generated System commands are attributed under this reserved source prefix.
+const SYSTEM_COMMAND_SOURCE_PREFIX: &str = "system/";
 const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 const STATE_HASH_DOMAIN: &[u8] = b"game-kernel-world-state-v2\0";
 
@@ -616,6 +618,16 @@ impl Kernel {
                     &envelope,
                     CommandRejectionCode::InvalidSourceId,
                     "invalid command source ID",
+                ));
+                continue;
+            }
+
+            // The Kernel owns this source namespace for commands emitted by Systems.
+            if envelope.id.source.starts_with(SYSTEM_COMMAND_SOURCE_PREFIX) {
+                rejected.push(reject(
+                    &envelope,
+                    CommandRejectionCode::InvalidSourceId,
+                    "command source uses the Kernel-reserved system namespace",
                 ));
                 continue;
             }
