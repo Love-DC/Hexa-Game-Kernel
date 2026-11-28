@@ -597,7 +597,11 @@ impl Kernel {
             *command_id_counts.entry(envelope.id.clone()).or_default() += 1;
         }
         external.sort_by(|left, right| {
-            (&left.id.source, left.id.sequence).cmp(&(&right.id.source, right.id.sequence))
+            (&left.id.source, left.id.sequence, left.id.tick).cmp(&(
+                &right.id.source,
+                right.id.sequence,
+                right.id.tick,
+            ))
         });
 
         for envelope in external {
@@ -1226,6 +1230,55 @@ mod tests {
             );
             assert_eq!(kernel.world().resource_i64("org.game/counter"), Some(0));
         }
+    }
+
+    #[test]
+    fn wrong_tick_commands_with_equal_source_and_sequence_are_permutation_deterministic() {
+        let envelope = |tick, value| CommandEnvelope {
+            id: CommandId {
+                tick: Tick(tick),
+                source: "external/test".to_owned(),
+                sequence: 7,
+            },
+            command: Command::SetResource {
+                key: "org.game/counter".to_owned(),
+                value: ComponentValue::Integer(value),
+            },
+        };
+        let first = envelope(1, 1);
+        let second = envelope(2, 2);
+
+        let mut forward_kernel = seeded_kernel(0);
+        let forward = forward_kernel
+            .step(StepInput {
+                commands: vec![first.clone(), second.clone()],
+            })
+            .unwrap();
+
+        let mut reverse_kernel = seeded_kernel(0);
+        let reverse = reverse_kernel
+            .step(StepInput {
+                commands: vec![second, first],
+            })
+            .unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward
+                .rejected_commands
+                .iter()
+                .map(|rejection| rejection.id.tick)
+                .collect::<Vec<_>>(),
+            [Tick(1), Tick(2)]
+        );
+        assert_eq!(
+            forward_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
+        assert_eq!(
+            reverse_kernel.world().resource_i64("org.game/counter"),
+            Some(0)
+        );
     }
 
     #[test]
